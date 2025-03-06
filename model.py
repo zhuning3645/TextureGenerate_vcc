@@ -80,6 +80,18 @@ def scale_latents(latents):
     latents = (latents - 0.22) * 0.75
     return latents
 
+class DinoFeatureModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.global_pool = nn.AdaptiveAvgPool2d((1, 1))  # 全局平均池化
+        self.fc = nn.Linear(320, 1024)                   # 线性映射
+
+    def forward(self, x):
+        x = self.global_pool(x)  # [batch, 320, 1, 1]
+        x = x.flatten(1)         # [batch, 320]
+        x = self.fc(x)            # [batch, 1024]
+        return x
+
 # 图像投影模型：将CLIP图像特征映射为提示词序列
 class ImageProjModel(torch.nn.Module):
     def __init__(self, clip_embed_dim=1024, cross_attention_dim=1024, num_tokens=4):
@@ -103,9 +115,6 @@ class ImageProjModel(torch.nn.Module):
         self.residual_norm = torch.nn.LayerNorm(cross_attention_dim)
         # 定义用于调整残差路径维度的线性变换
         self.residual_proj = nn.Linear(1024, 4096)
-
-  
-
         
     def forward(self, image_embeds):
         # image_embeds: [B, clip_embed_dim]
@@ -262,9 +271,7 @@ class WrapperLightningModule(pl.LightningModule):
         # 在类初始化或代码开始处添加
         warnings.filterwarnings("ignore", 
             message=".*cross_attention_kwargs.*are not expected by.*and will be ignored.*")
-        #self.pipe.text_encoder.requires_grad_(False)
-        #self.pipe.image_encoder.requires_grad_(False)
-        #self.prior = self.pipe.prior
+
 
         # 加载IP适配器
         # self.pipe.load_ip_adapter(
@@ -366,14 +373,15 @@ class WrapperLightningModule(pl.LightningModule):
 
         # self.pipe.unet.encoder_hid_proj.image_projection_layers.requires_grad_(True)
 
-        self.linear_layer = torch.nn.Linear(2949120, 1024)
-        self.linear_layer.requires_grad_(False)
-
-
         model = ImageProjModel()
         self.pipe.model = model.to(device)
         self.model = self.pipe.model
-        
+
+        df_model = DinoFeatureModel().type(torch.float16)
+        self.pipe.df_model = df_model.to(device)
+        self.df_model = self.pipe.df_model
+
+
         # 验证可训练参数数量
         trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
         print(f"Trainable parameters: {trainable_params}")  # 应大于0
@@ -450,17 +458,6 @@ class WrapperLightningModule(pl.LightningModule):
         ]).to(self.device)
         
         
-        # print(f"Batch keys: {batch.keys()}")
-        # if 'ref_normals' in batch and len(batch['ref_normals']) > 0:
-        #     f_ref_normal = batch['ref_normals']
-        #     f_ref_normal = f_ref_normal.squeeze(dim=1)
-        #     if isinstance(f_ref_normal, torch.Tensor):
-        #         print(f"First ref_normals tensor shape: {f_ref_normal.shape}, dtype: {first_input_image.dtype}")
-        #         print(f"First ref_normals tensor shape: {f_ref_normal[0].shape}, dtype: {first_input_image.dtype}")
-        #     else:
-        #         print(f"First ref_normals type: {type(f_ref_normal)}")
-        # else:
-        #     print("First ref_normals type: None")
         # 参考法线图
         if 'ref_normals' in batch and batch['ref_normals'] is not None:
             ref_normal = torch.stack([
@@ -485,9 +482,6 @@ class WrapperLightningModule(pl.LightningModule):
         init_latents = torch.zeros([1, 4, image_resolution // 8, image_resolution // 8], 
                                     device="cuda", dtype=torch.float16)
         lrm_generator_input['init_latents'] = init_latents.to(self.device)
-
-        #print("render_gt", _render_gt)
-        # render_gt['render_gt'] = _render_gt.to(self.device)
 
 
         return lrm_generator_input, render_gt
@@ -529,16 +523,17 @@ class WrapperLightningModule(pl.LightningModule):
         with torch.cuda.amp.autocast():
             ip_tokens = self.pipe.model(dino_features_ref)
 
-        # # ref_normal生成的ip_tokens
-        # ip_tokens = self.image_proj_model(dino_features_ref)
+
         # ip_tokens1 = torch.randn_like(dino_features_ref)
-        #print("---32----ip_tokens-------", ip_tokens.max(), ip_tokens.min())
-        # ip_tokens1 = ip_tokens1.requires_grad_(True)
-        # ip_tokens2 = self.image_proj_model(dino_features_ref)
+
         ip_tokens = ip_tokens.half()
-        #print("----16---ip_tokens-------", ip_tokens.max(), ip_tokens.min())
+
+        batch_size = ip_tokens.size(0)
+        # 根据bs扩展文本嵌入的维度
+        self.prompt_embeds = self.prompt_embeds.expand(batch_size, -1, -1)
 
         encoder_hidden_states = torch.cat([self.prompt_embeds, ip_tokens],dim=1)
+
         # #encoder_hidden_states = torch.cat([self.prompt_embeds,dino_features_ref], dim = 1)
         # self.check_tensor(ip_tokens, "ip_tokens")
         # self.check_tensor(encoder_hidden_states, "encoder_hidden_states")
@@ -568,12 +563,9 @@ class WrapperLightningModule(pl.LightningModule):
         ref_normal = ref_normal.squeeze(1)
         render_gt = render_gt.squeeze(1)
 
-        
-
         # sample random timestep
         B = image.shape[0]
         t = torch.randint(0, self.num_timesteps, size=(B,)).long().to(self.device)
-
 
         # classifier-free guidance
         if np.random.rand() < self.drop_cond_prob:
@@ -597,11 +589,11 @@ class WrapperLightningModule(pl.LightningModule):
         
         dino_features_ref = dino_features_ref.type(torch.float16)
         dino_features_ref = self.pipe.dino_controlnet.dino_controlnet_cond_embedding(dino_features_ref)
-        flattened_tensor = dino_features_ref.reshape(1, -1)
+        print(f"dino_features_ref:{dino_features_ref.shape}")# bs 320 96 96
 
         # 应用线性层
-        dino_features_ref = self.linear_layer(flattened_tensor)
-
+        dino_features_ref = self.pipe.df_model(dino_features_ref)
+        print(f"dino_features_ref:{dino_features_ref.shape}")# bs 1024
         self.check_tensor(latents, "latents")
         self.check_tensor(cond_latents, "cond_latents")
         self.check_tensor(dino_features_ref, "dino_features_ref")

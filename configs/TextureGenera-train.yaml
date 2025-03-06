@@ -12,7 +12,7 @@ model:
 data:
   target: src.data.building_texture.DataModuleFromConfig
   params:
-    batch_size: 1
+    batch_size: 8
     num_workers: 8
     train:
       target: src.data.building_texture.ObjaverseData
