@@ -122,7 +122,7 @@ class DINOv2_Encoder(torch.nn.Module):
     ):
         super(DINOv2_Encoder, self).__init__()
         
-        self.model = torch.hub.load('facebookresearch/dinov2', model_name)
+        self.model = torch.hub.load('./dinov2', model_name, source='local')
         self.model.eval().to(device)
         self.device = device
         self.antialias = antialias
@@ -699,58 +699,15 @@ class StableNormalPipeline(StableDiffusionControlNetPipeline, IPAdapterMixin):
                 image,
         )
 
-        # print("[Debug] ref_normal.requires_grad:", ref_normal.requires_grad)
-        # for name, param in self.image_proj_model.named_parameters():
-        #     print(f"[Debug] image_proj_model.{name} requires_grad: {param.requires_grad}")
-
-        for param in self.prior.parameters():
-            param.requires_grad = True  # 启用梯度
-        self.prior.train()  # 设置为训练模式（如果之前是 eval 模式）
-        # print("self.prompt", self.prompt_embeds.shape)
-
 
         dino_features_ref = self.prior(ref_normal)
         dino_features_ref = dino_features_ref.type(torch.float16)
-        # print("*******",dino_features_ref.shape) # 1 1024 48 48
-        # print("[Debug] dino_features_ref.requires_grad:", dino_features_ref.requires_grad) # false
-        # print("[Debug] dino_features_ref.grad_fn:", dino_features_ref.grad_fn) #None
         dino_features_ref = self.dino_controlnet.dino_controlnet_cond_embedding(dino_features_ref)
-        # print("*******",dino_features_ref.shape) # 1 320 96 96
-        # print("[Debug] dino_features_ref.requires_grad:", dino_features_ref.requires_grad)
-        # print("[Debug] dino_features_ref.grad_fn:", dino_features_ref.grad_fn)# <ConvolutionBackward0 object at 0x7efb8c15ca90>
-        # # pooled = nn.AdaptiveAvgPool2d((1, 1))(dino_features_ref)  # 输出形状 [1, 1024, 1, 1]
-        # # dino_features_ref = pooled.permute(0, 2, 3, 1)
+
         flattened_tensor = dino_features_ref.reshape(1, -1)
-        linear_layer = torch.nn.Linear(2949120, 1024).to(device='cuda:0')
-        # print("[Debug] dino_features_ref.grad_fn:", dino_features_ref.grad_fn)
+        # linear_layer = torch.nn.Linear(2949120, 1024).to(device='cuda:0')
         # 应用线性层
         dino_features_ref = linear_layer(flattened_tensor).to(device='cuda:0')
-
-        # print("*******",dino_features_ref.shape)# 1 1024
-        # print("[Debug] dino_features_ref.requires_grad:", dino_features_ref.requires_grad)
-        # print("[Debug] dino_features_ref.grad_fn:", dino_features_ref.grad_fn)# <AddmmBackward0 object at 0x7efb8c15ca90>
-
-        # 检查线性层参数是否可训练
-        # print("proj.weight requires_grad:", self.image_proj_model.proj.weight.requires_grad)
-        # print("norm.weight requires_grad:", self.image_proj_model.norm.weight.requires_grad)
-        # print("Model is in training mode:", self.image_proj_model.training)
-        # print("dino_features_ref is leaf tensor:", dino_features_ref.is_leaf)
-        # print("Gradient enabled:", torch.is_grad_enabled())
-
-        #print("*******2",dino_features_ref.shape)
-        ip_tokens = self.image_proj_model(dino_features_ref)
-        # print("[Debug] ip_tokens grad_fn after projection:", ip_tokens.grad_fn)
-        #ip_tokens = ip_tokens.requires_grad_(True)
-        # print("*******",ip_tokens.shape) #1 4 1024
-        encoder_hidden_states = torch.cat([self.prompt_embeds, ip_tokens],dim=1)
-        #encoder_hidden_states = encoder_hidden_states.requires_grad_(True)
-        # print("[Debug] dino_features_ref.requires_grad:", dino_features_ref.requires_grad)  # 如果为 False，则是问题根源
-        # print("[Debug] dino_features_ref.grad_fn:", dino_features_ref.grad_fn)
-        # print("[Debug] prompt_embeds requires_grad:", self.prompt_embeds.requires_grad)  # 应为 True 或 False
-        # print("[Debug] ip_tokens requires_grad:", ip_tokens.requires_grad)                # 应为 True
-        # print("[Debug] ip_tokens grad_fn:", ip_tokens.grad_fn)
-        # print("[Debug] encoder_hidden_states requires_grad:", encoder_hidden_states.requires_grad)
-        # print("[Debug] encoder_hidden_states grad_fn:", encoder_hidden_states.grad_fn)
         
 
         # 7. denoise sampling, using heuritic sampling proposed by Ye.
@@ -768,117 +725,36 @@ class StableNormalPipeline(StableDiffusionControlNetPipeline, IPAdapterMixin):
 
         cur_step = 0
 
-        # dino controlnet
-        dino_down_block_res_samples, dino_mid_block_res_sample = self.dino_controlnet(
-            dino_features.detach(),
-            0, # not depend on time steps
-            encoder_hidden_states=self.prompt_embeds,
-            conditioning_scale=cond_scale,
-            guess_mode=False,
-            return_dict=False,
-        )
-        assert dino_mid_block_res_sample == None
+        # # dino controlnet
+        # dino_down_block_res_samples, dino_mid_block_res_sample = self.dino_controlnet(
+        #     dino_features.detach(),
+        #     0, # not depend on time steps
+        #     encoder_hidden_states=self.prompt_embeds,
+        #     conditioning_scale=cond_scale,
+        #     guess_mode=False,
+        #     return_dict=False,
+        # )
+        # assert dino_mid_block_res_sample == None
 
         pred_latents = []
 
-        # ip-adapter嵌入pre 11.1 Optionally get Guidance Scale Embedding
-        timestep_cond = None
-        if self.unet.config.time_cond_proj_dim is not None:
-            guidance_scale_tensor = torch.tensor(self.guidance_scale - 1).repeat(batch_size * num_images_per_prompt)
-            timestep_cond = self.get_guidance_scale_embedding(
-                guidance_scale_tensor, embedding_dim=self.unet.config.time_cond_proj_dim
-            ).to(device=device, dtype=latents.dtype)
+        ref_normal = ref_normal.to(dtype=next(self.prior.parameters()).dtype)
+        dino_features_ref = self.prior(ref_normal)
+        dino_features_ref = dino_features_ref.type(torch.float16)
+        dino_features_ref = self.dino_controlnet.dino_controlnet_cond_embedding(dino_features_ref)
+        dino_features_ref = self.df_model(dino_features_ref)
+        ip_tokens = self.image_proj_model(dino_features_ref)
 
+        encoder_hidden_states = torch.cat([self.prompt_embeds, ip_tokens], dim = 1)
 
-        # if self.do_classifier_free_guidance:
-        #     prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds])
-
-        # 检查ip_adapter的嵌入
-        
-
-        #print("Checking unet.encoder_hid_proj:", self.unet.encoder_hid_proj)
-        #print("ipadapter:",ip_adapter_image)
-        #self.image_encoder.config.image_size = 768
-        # print(self.image_encoder.config)
-        # print(self.unet.config.cross_attention_dim)
-
-        # self.unet.encoder_hid_proj.image_projection_layers[0].image_embeds = nn.Linear(1024, 4096,device='cuda:0')
-        # self.unet.encoder_hid_proj.image_projection_layers[0].norm = nn.LayerNorm(1024,device='cuda:0')
-        
-        #print("Modified structure:", self.unet.encoder_hid_proj)
-        # target_module = self.unet.encoder_hid_proj.image_projection_layers[0]
-        # target_module.image_embeds = target_module.image_embeds.half()
-        # target_module.norm = target_module.norm.half()
-        # print("image_embeds layer dtype:", target_module.image_embeds.weight.dtype)  # 应为 torch.float16
-        # print("norm layer dtype:", target_module.norm.weight.dtype) 
-        #print("ipadapteriamegembeds",ip_adapter_image_embeds)
-        # ip_adapter_image_embeds = dino_features_ref
-        
-        
-        # if ip_adapter_image is not None or ip_adapter_image_embeds is not None:
-        #     image_embeds = self.prepare_ip_adapter_image_embeds(
-        #         ip_adapter_image,
-        #         ip_adapter_image_embeds,
-        #         device,
-        #         batch_size * num_images_per_prompt,
-        #         do_classifier_free_guidance = None,
-        #     )
-        # print("&&&&&&&&&&&&",image_embeds[0].shape)
-        # print("&&&&&&&&&&&&",image_embeds[0].device)
-
-
-        #target_layer = self.unet.encoder_hid_proj.image_projection_layers[0].image_embeds
-        #print(f"Image projection layer is on device: {target_layer.weight.device}")
-
-        # for name, module in self.unet.named_modules():
-        #     if "ip_adapter" in name:
-        #         print("Model layer:", name)
-
-        # 6.1 Add image embeds for IP-Adapter
-        # added_cond_kwargs = (
-        #     {"image_embeds": image_embeds}
-        #     if (ip_adapter_image is not None or ip_adapter_image_embeds is not None)
-        #     else None
-        # )
-        # if ip_adapter_image is not None or ip_adapter_image_embeds is not None:
-        #     #print("Condition met: ip_adapter_image is not None or ip_adapter_image_embeds is not None")
-        #     added_cond_kwargs = {"image_embeds": image_embeds}
-        # else:
-        #     #print("Condition not met: ip_adapter_image and ip_adapter_image_embeds are both None")
-        #     added_cond_kwargs = None
        
-        # print("ipadapter_embed",image_embeds[0].shape)
-        # print(added_cond_kwargs)
-        # print("prompts_embeds:", self.prompt_embeds.shape)
-        # print("cross_attention_kwargs",self.cross_attention_kwargs)
-        train_sched = DDPMScheduler.from_config(self.scheduler.config)
-        # if isinstance(self.unet, UNet2DConditionModel):
-        #     self.unet = RefOnlyNoisedUNet(self.unet, train_sched, self.scheduler)
-
-        self.train_scheduler = train_sched 
-
-
-        
         # Denoising loop
         last_pred_latent = pred_latent
 
-        noise = torch.randn_like(pred_latent)
-        # print("_________t_______",t)
-        # latents = self.encode_target_images(render_gt)
-        #添加的噪声
-        v_target = self.get_v(pred_latent, noise, t)
-        v_target = v_target.half()
-        
-        # print("_________t_______",len(self.scheduler.timesteps))
-        # print("_________t_______",len(self.scheduler.prev_timesteps))
-
-
-        #对目标图像进行加噪
-        latents_noisy = self.train_scheduler.add_noise(pred_latent, noise, t)
         
         for (t, prev_t) in self.progress_bar(zip(self.scheduler.timesteps,self.scheduler.prev_timesteps), leave=False, desc="Diffusion steps..."):
 
-            _dino_down_block_res_samples = [dino_down_block_res_sample for dino_down_block_res_sample in dino_down_block_res_samples]  # copy, avoid repeat quiery
+            #_dino_down_block_res_samples = [dino_down_block_res_sample for dino_down_block_res_sample in dino_down_block_res_samples]  # copy, avoid repeat quiery
 
             # controlnet
             # down_block_res_samples, mid_block_res_sample = self.controlnet(
@@ -893,7 +769,7 @@ class StableNormalPipeline(StableDiffusionControlNetPipeline, IPAdapterMixin):
 
             # SG-DRN
             # 在每个时间步t中，模型使用DINO UNet进行去噪操作 
-            prev_noise = self.dino_unet_forward(
+            noise = self.dino_unet_forward(
                 self.unet,
                 pred_latent,
                 t,
@@ -903,7 +779,7 @@ class StableNormalPipeline(StableDiffusionControlNetPipeline, IPAdapterMixin):
                 return_dict=False,
             )[0]  # [B,4,h,w]
 
-            # print(pred_latent.shape, t, prompt_embeds.shape, self.cross_attention_kwargs)
+
             pred_latents.append(noise)
             # ddim steps 利用调度器更新潜在变量
             out = self.scheduler.step(
@@ -945,9 +821,7 @@ class StableNormalPipeline(StableDiffusionControlNetPipeline, IPAdapterMixin):
         return StableNormalOutput(
             prediction=prediction,
             latent=pred_latent,
-            gaus_noise=gaus_noise,
-            prev_noise = prev_noise, # 预测噪声
-            v_target = v_target, # 实际添加噪声
+            gaus_noise=gaus_noise
         )
 
     # Copied from diffusers.pipelines.marigold.pipeline_marigold_depth.MarigoldDepthPipeline.prepare_latents

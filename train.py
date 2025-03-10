@@ -275,6 +275,9 @@ if __name__ == "__main__":
     data.prepare_data()
     data.setup("fit")
 
+
+    print(f"batch_size:{config.data.params.batch_size}")
+
     # configure learning rate
     base_lr = config.model.base_learning_rate
     if 'accumulate_grad_batches' in lightning_config.trainer:
@@ -286,7 +289,6 @@ if __name__ == "__main__":
     model.learning_rate = base_lr
     rank_zero_print("++++ NOT USING LR SCALING ++++")
     rank_zero_print(f"Setting learning rate to {model.learning_rate:.2e}")
-
 
 
     # run training loop

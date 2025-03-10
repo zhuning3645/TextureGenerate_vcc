@@ -1,7 +1,7 @@
 import torch
 import pytorch_lightning as pl
 import os
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List, Union
 import torch
 import numpy as np
 from torchvision.utils import make_grid, save_image
@@ -18,45 +18,40 @@ dependencies = ["torch", "numpy", "diffusers", "PIL"]
 from stablenormal.pipeline_yoso_normal import YOSONormalsPipeline
 from stablenormal.pipeline_stablenormal import StableNormalPipeline
 from stablenormal.scheduler.heuristics_ddimsampler import HEURI_DDIMScheduler
-from torchvision.transforms import v2
 import warnings
+import math
 
 
 
-def pad_to_square(image: torch.Tensor) -> Tuple[torch.Tensor, Tuple[int, int], Tuple[int, int, int, int]]:
-    """Pad the input tensor to make it square (C, H, W)."""
-    _, h, w = image.shape
-    size = max(h, w)
+def batch_pad_to_square(images: torch.Tensor) -> Tuple[torch.Tensor, Tuple[int, int]]:
+    """优化的批量填充方法"""
+    B, C, H, W = images.shape
+    max_size = max(H, W)
     
-    delta_w = size - w
-    delta_h = size - h
+    # 计算对称填充量
+    pad_h = (max_size - H) // 2, (max_size - H + 1) // 2
+    pad_w = (max_size - W) // 2, (max_size - W + 1) // 2
     
-    # Padding format: (left, right, top, bottom)
-    padding = (delta_w // 2, delta_w - (delta_w // 2),
-               delta_h // 2, delta_h - (delta_h // 2))
-    
-    padded = F.pad(image, padding)
-    return padded, (h, w), (delta_w//2, delta_h//2, delta_w - delta_w//2, delta_h - delta_h//2)
+    # 使用高效填充
+    return F.pad(images, (pad_w[0], pad_w[1], pad_h[0], pad_h[1])), (H, W)
 
-def resize_image(image: torch.Tensor, resolution: int) -> Tuple[torch.Tensor, Tuple[int, int], Tuple[float, float]]:
-    """Resize tensor while maintaining aspect ratio and pad to multiple of 64 (C, H, W)."""
-    _, h, w = image.shape
-    min_dim = min(h, w)
-    scale = resolution / min_dim
+def batch_resize(images: torch.Tensor, resolution: int) -> torch.Tensor:
+    """批量调整大小并保持宽高比 (B, C, H, W)"""
+    B, C, H, W = images.shape
+    scale = resolution / min(H, W)
     
-    # Calculate new dimensions
-    new_h = int(round(h * scale / 64)) * 64
-    new_w = int(round(w * scale / 64)) * 64
-
-    # Resize with bicubic interpolation
-    resized = F.interpolate(
-        image.unsqueeze(0),
-        size=(new_h, new_w),
+    # 向量化计算新尺寸
+    new_H = (H * scale / 64).int() * 64
+    new_W = (W * scale / 64).int() * 64
+    
+    # 使用组合插值方法
+    return F.interpolate(
+        images,
+        size=(new_H.item(), new_W.item()),
         mode='bicubic',
-        align_corners=False
-    ).squeeze(0)
-    
-    return resized, (h, w), (new_h/h, new_w/w)
+        align_corners=False,
+        antialias=True
+    )
 
 def center_crop(image: torch.Tensor) -> Tuple[torch.Tensor, Tuple[int, int], Tuple[int, int, int, int]]:
     """Crop the center of the tensor to make it square (C, H, W)."""
@@ -123,18 +118,18 @@ class ImageProjModel(torch.nn.Module):
 
         residual = self.residual_norm(image_embeds)
 
-        print(f"image_embeds: {image_embeds.shape}")# 1 1024
+        #print(f"image_embeds: {image_embeds.shape}")# 1 1024
 
-        print(residual.shape) # 1 1024
+        #print(residual.shape) # 1 1024
         # 报错的地方，试了残差结构还是没办法解决
 
         x = self.proj(residual)  # [B, cross_attention_dim * num_tokens]
         x = self.proj_norm(x)
-        print(x.shape) # 1 4096
+        #print(x.shape) # 1 4096
         residual_transformed = self.residual_proj(residual)
         x += residual_transformed
         
-        print(f"proj output x type: {x.dtype}")
+        #print(f"proj output x type: {x.dtype}")
         #判断NaN断言
         assert torch.isnan(x).sum() == 0, print(x)
 
@@ -201,7 +196,6 @@ class IPAdapter(torch.nn.Module):
 class WrapperLightningModule(pl.LightningModule):
     def __init__(
         self, 
-        #feature_extractor_vae: CLIPImageProcessor,
         local_cache_dir: Optional[str] = None, 
         ckpt_path:Optional[str] = None,
         device="cuda:0", 
@@ -227,6 +221,15 @@ class WrapperLightningModule(pl.LightningModule):
         self.prompt = prompt
         self.prompt_embeds = None
         torch.autograd.set_detect_anomaly(True)
+        # 添加内存优化配置
+        self.batch_format_ready = False
+        
+        # 缓存预处理结果
+        self.preprocessed_cache = {}
+        
+        # 自动混合精度配置
+        self.autocast_enabled = True
+        self.scaler = torch.cuda.amp.GradScaler(enabled=True)
 
         
 
@@ -373,13 +376,15 @@ class WrapperLightningModule(pl.LightningModule):
 
         # self.pipe.unet.encoder_hid_proj.image_projection_layers.requires_grad_(True)
 
-        model = ImageProjModel()
-        self.pipe.model = model.to(device)
-        self.model = self.pipe.model
+        # model = ImageProjModel()
+        # self.pipe.model = model.to(self.device)
+        # self.model = self.pipe.model
 
         df_model = DinoFeatureModel().type(torch.float16)
         self.pipe.df_model = df_model.to(device)
         self.df_model = self.pipe.df_model
+
+
 
 
         # 验证可训练参数数量
@@ -390,42 +395,49 @@ class WrapperLightningModule(pl.LightningModule):
 
 
     
-    
-    def _preprocess_image(
-            self,
-            image: Image.Image,
-            ref_normal: Optional[Image.Image] = None,
-            image_resolution=768,
-            mode='stable',
-            preprocess='pad'
-        ) -> torch.Tensor:
-
-        """图像预处理管道"""
-        preprocess='pad'
-        if image.mode == 'RGBA':
-            image = image.convert('RGB')
-
-        if preprocess == 'pad':
-            image, original_size, padding_info = pad_to_square(image)
-        elif preprocess == 'crop':
-            image, original_size, crop_info = center_crop(image)
+    def _preprocess_image(self, images: Union[List[Image.Image], torch.Tensor]) -> torch.Tensor:
+        """批量预处理管道（兼容PIL和Tensor输入）"""
+        # 输入格式验证
+        if isinstance(images, list):
+            # 情况1：输入为PIL图像列表
+            tensor_batch = torch.stack([
+                transforms.functional.to_tensor(img.convert('RGB')) 
+                for img in images
+            ]).to(self.device, non_blocking=True)
+        elif isinstance(images, torch.Tensor):
+            # 情况2：输入已经是预处理过的Tensor
+            if images.dim() == 3:
+                tensor_batch = images.unsqueeze(0).to(self.device)
+            elif images.dim() == 4:
+                tensor_batch = images.to(self.device)
+            else:
+                raise ValueError(f"Invalid tensor dimensions: {images.shape}")
         else:
-            raise ValueError("Invalid preprocessing mode. Choose 'pad' or 'crop'.")
+            raise TypeError(f"Unsupported input type: {type(images)}")
 
-        image, original_dims, scaling_factors = resize_image(image, image_resolution)
-
-        if ref_normal is not None:
-            ref_normal = ref_normal.convert('RGB')
-            if preprocess == 'pad':
-                ref_normal, _, _ = pad_to_square(ref_normal)
-            elif preprocess == 'crop':
-                ref_normal, _, _ = center_crop(ref_normal)
+        # 自动混合精度优化
+        with torch.cuda.amp.autocast(enabled=self.autocast_enabled):
+            # 批量填充 (B, C, H, W)
+            padded, _ = batch_pad_to_square(tensor_batch)
             
-        # 调整大小
-        #ref_normal, _, _ = resize_image(ref_normal, image_resolution)
-        
-        
-        return image.unsqueeze(0).to(self.device)
+            # 带反锯齿的调整大小
+            resized = F.interpolate(
+                padded,
+                size=(768, 768),
+                mode='bicubic',
+                align_corners=False,
+                antialias=True
+            )
+            
+        # 归一化到[-1, 1]范围
+        return resized.mul(2).sub(1)
+    
+    def _optimize_batch_format(self):
+        """优化批量处理配置"""
+        torch.backends.cudnn.benchmark = True
+        torch.autograd.profiler.profile(False)
+        torch.autograd.profiler.emit_nvtx(False)
+        self.batch_format_ready = True
     
     def prepare_batch_data(self, batch):
         """
@@ -440,17 +452,6 @@ class WrapperLightningModule(pl.LightningModule):
         render_gt = {}   # for supervision
         processed = {}
         
-        # 打印 batch 的类型和内容（前几项）
-        # print(f"Batch type: {type(batch)}")
-        # print(f"Batch keys: {batch.keys()}")
-        # if 'input_images' in batch and len(batch['input_images']) > 0:
-        #     first_input_image = batch['input_images']
-        #     if isinstance(first_input_image, torch.Tensor):
-        #         print(f"First input_image tensor shape: {first_input_image.shape}, dtype: {first_input_image.dtype}")
-        #     else:
-        #         print(f"First input_image type: {type(first_input_image)}")
-        # else:
-        #     print("First input_image type: None")
 
         # 图像预处理
         images = torch.stack([
@@ -513,15 +514,16 @@ class WrapperLightningModule(pl.LightningModule):
 
         # 观察给定数据和随机生成的数据取值范围
         #print("-------dino_features_ref-------",dino_features_ref.max(), dino_features_ref.min())
-        #dino_randn = torch.randn_like(dino_features_ref)
+        dino_randn = torch.randn_like(dino_features_ref)
         #print("-------dino_randn-------", dino_randn.max(), dino_randn.min())
         #dino_randn = dino_randn.float()
         #dino_features_ref = dino_features_ref.float()
         #ip_tokens = self.image_proj_model(dino_randn)
         #ip_tokens = model(dino_features_ref)
+        
 
         with torch.cuda.amp.autocast():
-            ip_tokens = self.pipe.model(dino_features_ref)
+            ip_tokens = self.pipe.model(dino_randn)
 
 
         # ip_tokens1 = torch.randn_like(dino_features_ref)
@@ -529,14 +531,17 @@ class WrapperLightningModule(pl.LightningModule):
         ip_tokens = ip_tokens.half()
 
         batch_size = ip_tokens.size(0)
+        print(f"ip_tokens:{ip_tokens.shape}")
         # 根据bs扩展文本嵌入的维度
-        self.prompt_embeds = self.prompt_embeds.expand(batch_size, -1, -1)
+        self.prompt_embeds = self.prompt_embeds.repeat(batch_size, 1, 1)
+        print(f"self.prompt_embeds:{self.prompt_embeds.shape}")
 
         encoder_hidden_states = torch.cat([self.prompt_embeds, ip_tokens],dim=1)
 
         # #encoder_hidden_states = torch.cat([self.prompt_embeds,dino_features_ref], dim = 1)
         # self.check_tensor(ip_tokens, "ip_tokens")
         # self.check_tensor(encoder_hidden_states, "encoder_hidden_states")
+
         
         prev_noise = self.pipe.dino_unet_forward(
                 self.pipe.unet,
@@ -555,94 +560,107 @@ class WrapperLightningModule(pl.LightningModule):
         return prev_noise
     
     def training_step(self, batch, batch_idx):
-        # 准备数据
-        model_inputs, render_gt = self.prepare_batch_data(batch)
-        image = model_inputs['images']
-        ref_normal = model_inputs['ref_normals']
-        image = image.squeeze(1)  
-        ref_normal = ref_normal.squeeze(1)
-        render_gt = render_gt.squeeze(1)
 
-        # sample random timestep
-        B = image.shape[0]
-        t = torch.randint(0, self.num_timesteps, size=(B,)).long().to(self.device)
+        with torch.cuda.amp.autocast(enabled=self.autocast_enabled):
+            model_inputs, render_gt = self.prepare_batch_data(batch)
 
-        # classifier-free guidance
-        if np.random.rand() < self.drop_cond_prob:
-            cond_latents = self.encode_condition_image(torch.zeros_like(image))
-        else:
-            cond_latents = self.encode_condition_image(image)
+            image = model_inputs['images']
+            ref_normal = model_inputs['ref_normals']
 
+            image = image.squeeze(1)  
+            ref_normal = ref_normal.squeeze(1)
+            render_gt = render_gt.squeeze(1)
 
-        train_sched = DDPMScheduler.from_config(self.pipe.scheduler.config)
-        self.train_scheduler = train_sched
-         
-   
-        latents = self.encode_target_images(render_gt)
-        noise = torch.randn_like(latents)
-        latents_noisy = self.train_scheduler.add_noise(latents, noise, t)
-    
+            # sample random timestep
+            B = image.shape[0]
+            t = torch.randint(0, self.num_timesteps, size=(B,)).long().to(self.device)
 
-        #t_value = t.item()
-        ref_normal = ref_normal.to(dtype=next(self.pipe.prior.parameters()).dtype)
-        dino_features_ref = self.pipe.prior(ref_normal)
+            # classifier-free guidance
+            if np.random.rand() < self.drop_cond_prob:
+                cond_latents = self.encode_condition_image(torch.zeros_like(image))
+            else:
+                cond_latents = self.encode_condition_image(image)
+            
+            train_sched = DDPMScheduler.from_config(self.pipe.scheduler.config)
+            self.train_scheduler = train_sched
+            
+            #生成latenst_noisy的作为预测过程的起始量  
+            latents = self.encode_target_images(render_gt)
+            noise = torch.randn_like(latents)
+            latents_noisy = self.train_scheduler.add_noise(latents, noise, t)
         
-        dino_features_ref = dino_features_ref.type(torch.float16)
-        dino_features_ref = self.pipe.dino_controlnet.dino_controlnet_cond_embedding(dino_features_ref)
-        print(f"dino_features_ref:{dino_features_ref.shape}")# bs 320 96 96
 
-        # 应用线性层
-        dino_features_ref = self.pipe.df_model(dino_features_ref)
-        print(f"dino_features_ref:{dino_features_ref.shape}")# bs 1024
-        self.check_tensor(latents, "latents")
-        self.check_tensor(cond_latents, "cond_latents")
-        self.check_tensor(dino_features_ref, "dino_features_ref")
+            #对ref_normal使用dino encoder 生成features
+            ref_normal = ref_normal.to(dtype=next(self.pipe.prior.parameters()).dtype)
+            dino_features_ref = self.pipe.prior(ref_normal)
+            dino_features_ref = dino_features_ref.type(torch.float16)
+            dino_features_ref = self.pipe.dino_controlnet.dino_controlnet_cond_embedding(dino_features_ref)
+            # print(f"dino_features_ref:{dino_features_ref.shape}")# bs 320 96 96
+            # 对dino encoder features应用线性层
+            dino_features_ref = self.pipe.df_model(dino_features_ref)
 
-        
-        # gt图像的latents 时间步 起始噪声张量 参考图片 目标图像
-        prev_noise = self.forward(
-                    latents = latents_noisy,
-                    t = t,
-                    cond_latents=cond_latents,
-                    dino_features_ref = dino_features_ref,
-                )
+            v_target = self.get_v(latents, noise, t).half()
 
 
-        v_target = self.get_v(latents, noise, t).half()
+            #使用dino encoder的特征生成tokens
+            ip_tokens = self.pipe.image_proj_model(dino_features_ref)
+            ip_tokens = ip_tokens.half()
+            batch_size = ip_tokens.size(0)
+            # 根据bs扩展文本嵌入的维度
+            self.prompt_embeds = self.prompt_embeds.expand(batch_size, -1, -1)
+            encoder_hidden_states = torch.cat([self.prompt_embeds, ip_tokens],dim=1)
 
+            # 内存优化：释放不需要的缓存
+            torch.cuda.empty_cache()
+            
+            # 使用梯度累积 
+            prev_noise = self._forward_pass(latents_noisy, cond_latents, t, encoder_hidden_states)
+            loss, loss_dict = self.compute_loss(prev_noise, v_target)
 
-        print("Prev_noise max/min:", prev_noise.max(), prev_noise.min())
-        print("v_target max/min:", v_target.max(), v_target.min())
-        # 计算损失 预测噪声 & 实际添加噪声
-        loss, loss_dict = self.compute_loss(prev_noise, v_target)  
-        
-        # 日志记录
-        self.log_dict(
-            loss_dict,
-            prog_bar=True,
-            logger=True,
-            on_step=True,
-            on_epoch=True
-        )
-        
-        self.log('train_loss',
-            loss,
-            on_step=True, 
-            on_epoch=True,
-            prog_bar=True,
-            logger=True
-        )
-        
-        # 可视化保存（每1000步）
+            
+            # 日志记录
+            self.log_dict(
+                loss_dict,
+                prog_bar=True,
+                logger=True,
+                on_step=True,
+                on_epoch=True
+            )
+            
+            self.log('train_loss',
+                loss,
+                on_step=True, 
+                on_epoch=True,
+                prog_bar=True,
+                logger=True
+            )
+
+            #可视化保存（每1000步）
         # if self.global_step % 500 == 0 and self.global_rank == 0:
         #     self._save_training_samples(prev_noise, batch)
-        # 释放中间变量
-        # del prev_noise, v_target, latents_noisy, noise, cond_latents
-        # torch.cuda.empty_cache()  # 可选，但谨慎使用
+            
+            return loss
 
-
-        return loss.mean()
     
+    def _forward_pass(self, latents_noisy, cond_latents, t, encoder_hidden_states):
+        """优化的前向传播"""
+        #给定起始条件 coarse normal的潜在变量
+        cross_attention_kwargs = dict(cond_lat=cond_latents)
+
+        pred_latent = latents_noisy
+        t = t
+
+        prev_noise = self.pipe.dino_unet_forward(
+            self.pipe.unet,
+            pred_latent,
+            t,
+            encoder_hidden_states = encoder_hidden_states,
+            #cross_attention_kwargs = cross_attention_kwargs,
+            return_dict = False,
+        )[0]
+
+
+        return prev_noise
 
     
     def check_tensor(self, tensor, name):
@@ -710,6 +728,7 @@ class WrapperLightningModule(pl.LightningModule):
     #     image_pt = image_pt.to(device=self.device, dtype=dtype)
     #     latents = self.pipe.vae.encode(image_pt).latent_dist.sample()
     #     return latents
+
     def encode_condition_image(self, images):
         dtype = next(self.pipe.vae.parameters()).dtype
         
@@ -742,27 +761,45 @@ class WrapperLightningModule(pl.LightningModule):
         return resample_map.get(resample_id, "bicubic")
 
     def configure_optimizers(self):
-
-        lr = 1e-5
-
-        # 优化器配置
-        params = [
-            {"params": self.pipe.image_proj_model.parameters()},
-            {"params": self.pipe.model.parameters()},
-        ]
-        
-        optimizer = torch.optim.AdamW(params, lr = lr)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-            optimizer, 
-            T_0=3000, 
-            eta_min=lr/4
+        # 添加自动学习率缩放
+        base_lr = self.learning_rate
+        optimizer = torch.optim.AdamW(
+            self.parameters(), 
+            lr=base_lr,
+            fused=True  # 启用融合优化器
         )
         
-        return {
-            'optimizer': optimizer,
-            'lr_scheduler': scheduler,
-            "gradient_clip_val": 1.0,
+        # 动态调整学习率
+        scheduler = {
+            'scheduler': torch.optim.lr_scheduler.OneCycleLR(
+                optimizer,
+                max_lr=base_lr,
+                total_steps=10000,
+                pct_start=0.3
+            ),
+            'interval': 'step'
         }
+        return [optimizer], [scheduler]
+    
+
+    # def configure_optimizers(self):
+    #     lr = 1e-5
+    #     # 优化器配置
+    #     params = [
+    #         {"params": self.pipe.image_proj_model.parameters()},
+    #         #{"params": self.pipe.model.parameters()},
+    #     ]
+    #     optimizer = torch.optim.AdamW(params, lr = lr)
+    #     scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+    #         optimizer, 
+    #         T_0=3000, 
+    #         eta_min=lr/4
+    #     )
+    #     return {
+    #         'optimizer': optimizer,
+    #         'lr_scheduler': scheduler,
+    #         "gradient_clip_val": 1.0,
+    #     }
 
 
 
