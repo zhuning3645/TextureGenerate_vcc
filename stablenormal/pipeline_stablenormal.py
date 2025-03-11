@@ -775,7 +775,7 @@ class StableNormalPipeline(StableDiffusionControlNetPipeline, IPAdapterMixin):
                 t,
                 encoder_hidden_states=encoder_hidden_states,
                 cross_attention_kwargs=self.cross_attention_kwargs,
-                dino_down_block_additional_residuals=_dino_down_block_res_samples,
+                #dino_down_block_additional_residuals=_dino_down_block_res_samples,
                 return_dict=False,
             )[0]  # [B,4,h,w]
 

@@ -20,6 +20,7 @@ from stablenormal.pipeline_stablenormal import StableNormalPipeline
 from stablenormal.scheduler.heuristics_ddimsampler import HEURI_DDIMScheduler
 import warnings
 import math
+from itertools import chain
 
 
 
@@ -64,7 +65,13 @@ def center_crop(image: torch.Tensor) -> Tuple[torch.Tensor, Tuple[int, int], Tup
     cropped = image[:, top:top+crop_size, left:left+crop_size]
     return cropped, (h, w), (left, top, left+crop_size, top+crop_size)
 
+def unscale_latents(latents):
+    latents = latents / 0.75 + 0.22
+    return latents
 
+def unscale_image(image):
+    image = image / 0.5 * 0.8
+    return image
 
 def extract_into_tensor(a, t, x_shape):
     b, *_ = t.shape
@@ -118,9 +125,7 @@ class ImageProjModel(torch.nn.Module):
 
         residual = self.residual_norm(image_embeds)
 
-        #print(f"image_embeds: {image_embeds.shape}")# 1 1024
 
-        #print(residual.shape) # 1 1024
         # 报错的地方，试了残差结构还是没办法解决
 
         x = self.proj(residual)  # [B, cross_attention_dim * num_tokens]
@@ -134,9 +139,7 @@ class ImageProjModel(torch.nn.Module):
         assert torch.isnan(x).sum() == 0, print(x)
 
         x = self.act(x)
-
         x = x.reshape(-1, self.num_tokens, self.cross_attention_dim)  # [B, num_tokens, cross_attention_dim]
-        #print(f"act output max/min: {x.max()}, {x.min()}")
 
         x = self.norm(x)
         
@@ -173,23 +176,6 @@ class AttnProcessorWrapper(torch.nn.Module):
         return self.processor(*args, **kwargs)
 
 
-class IPAdapter(torch.nn.Module):
-    """IP-Adapter"""
-    def __init__(self, unet, image_proj_model, adapter_modules, ckpt_path=None):
-        super().__init__()
-        self.unet = unet
-        self.image_proj_model = image_proj_model
-        self.adapter_modules = adapter_modules
-
-        if ckpt_path is not None:
-            self.load_from_checkpoint(ckpt_path)
-
-    def forward(self, noisy_latents, timesteps, encoder_hidden_states, image_embeds):
-        ip_tokens = self.image_proj_model(image_embeds)
-        encoder_hidden_states = torch.cat([encoder_hidden_states, ip_tokens], dim=1)
-        # Predict the noise residual
-        noise_pred = self.unet(noisy_latents, timesteps, encoder_hidden_states).sample
-        return noise_pred
 
 
 # 创建 LightningModule 作为封装器
@@ -216,7 +202,6 @@ class WrapperLightningModule(pl.LightningModule):
         # self.ip_adpter_weight = ip_adpter_weight
         self.num_timesteps = 50
         self.drop_cond_prob = drop_cond_prob
-        #self.feature_extractor_vae = feature_extractor_vae
         self.automatic_optimization = True
         self.prompt = prompt
         self.prompt_embeds = None
@@ -230,9 +215,7 @@ class WrapperLightningModule(pl.LightningModule):
         # 自动混合精度配置
         self.autocast_enabled = True
         self.scaler = torch.cuda.amp.GradScaler(enabled=True)
-
-        
-
+    
 
         # 初始化模型组件
         self.x_start_pipeline = YOSONormalsPipeline.from_pretrained(
@@ -259,13 +242,14 @@ class WrapperLightningModule(pl.LightningModule):
             ignore_mismatched_sizes=True
         )
 
+        #初始化pipeline
         self.x_start_pipeline.to(device)
         self.pipe.to(device)
 
         self.sqrt_alphas_cumprod = torch.sqrt(self.pipe.scheduler.alphas_cumprod).to(device='cuda:0')
         self.sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - self.pipe.scheduler.alphas_cumprod).to(device='cuda:0')
 
-
+        #冻结不更新参数的组件
         self.pipe.unet.requires_grad_(False)
         self.pipe.vae.requires_grad_(False)
         self.sqrt_alphas_cumprod.requires_grad_(False)
@@ -291,7 +275,6 @@ class WrapperLightningModule(pl.LightningModule):
         #     num_tokens=4,
         # ).float().cuda().to(device)
         image_proj_model = ImageProjModel().cuda()
-        #model = ImageProjModel().float().cuda()
         
 
         # init adapter modules
@@ -345,12 +328,13 @@ class WrapperLightningModule(pl.LightningModule):
         self.pipe.adapter_modules=self.adapter_modules
 
         self.pipe.image_proj_model.requires_grad_(True)
-        self.pipe.adapter_modules.requires_grad_(False)
+        self.pipe.adapter_modules.requires_grad_(True)
             
         # 日志目录
         self.log_dir = "training_logs"
         os.makedirs(self.log_dir, exist_ok=True)
 
+        #生成文本嵌入
         num_images_per_prompt = 1
         with torch.no_grad():
             if self.prompt_embeds is None:
@@ -367,18 +351,6 @@ class WrapperLightningModule(pl.LightningModule):
                 self.prompt_embeds = prompt_embeds
         
         
-        #print(self)
-        #print("unet.config.cross_attention_dim",self.pipe.unet.config.cross_attention_dim)
-        #print("clip_embeddings_dim",self.pipe.image_encoder.config.projection_dim)
-
-        # self.pipe.unet.encoder_hid_proj.image_projection_layers[0].image_embeds = nn.Linear(1024, 4096, device='cuda:0')
-        # self.pipe.unet.encoder_hid_proj.image_projection_layers[0].norm = nn.LayerNorm(1024, device='cuda:0')
-
-        # self.pipe.unet.encoder_hid_proj.image_projection_layers.requires_grad_(True)
-
-        # model = ImageProjModel()
-        # self.pipe.model = model.to(self.device)
-        # self.model = self.pipe.model
 
         df_model = DinoFeatureModel().type(torch.float16)
         self.pipe.df_model = df_model.to(device)
@@ -432,6 +404,7 @@ class WrapperLightningModule(pl.LightningModule):
         # 归一化到[-1, 1]范围
         return resized.mul(2).sub(1)
     
+
     def _optimize_batch_format(self):
         """优化批量处理配置"""
         torch.backends.cudnn.benchmark = True
@@ -439,6 +412,7 @@ class WrapperLightningModule(pl.LightningModule):
         torch.autograd.profiler.emit_nvtx(False)
         self.batch_format_ready = True
     
+
     def prepare_batch_data(self, batch):
         """
         输入数据格式:
@@ -523,7 +497,7 @@ class WrapperLightningModule(pl.LightningModule):
         
 
         with torch.cuda.amp.autocast():
-            ip_tokens = self.pipe.model(dino_randn)
+            ip_tokens = self.pipe.model(dino_features_ref)
 
 
         # ip_tokens1 = torch.randn_like(dino_features_ref)
@@ -635,27 +609,57 @@ class WrapperLightningModule(pl.LightningModule):
                 logger=True
             )
 
+            lr = self.optimizers().param_groups[0]['lr']
+            self.log('lr_abs', lr, prog_bar=True, logger=True, on_step=True, on_epoch=False)
+
             #可视化保存（每1000步）
-        # if self.global_step % 500 == 0 and self.global_rank == 0:
-        #     self._save_training_samples(prev_noise, batch)
+        if self.global_step % 50 == 0 and self.global_rank == 0:
+            with torch.no_grad():
+                #预测起始latents、时间步、预测噪声
+                latents_pred = self.predict_start_from_z_and_v(latents_noisy, t, prev_noise)
+
+                latents = unscale_latents(latents_pred)
+                # 将 scaling_factor 转换为张量，并确保类型和设备匹配
+                self.pipe.vae.config.scaling_factor = torch.tensor(
+                    self.pipe.vae.config.scaling_factor,
+                    dtype=torch.float16,  # 强制使用 float16
+                    device=latents.device
+                )
+
+                # 确保 latents 是 float16
+                latents = latents.to(torch.float16)
+                images = unscale_image(self.pipe.vae.decode(latents / self.pipe.vae.config.scaling_factor, return_dict=False)[0])   # [-1, 1]
+                images = (images * 0.5 + 0.5).clamp(0, 1)
+                images = torch.cat([render_gt, images], dim=-2)
+
+                grid = make_grid(images, nrow=images.shape[0], normalize=True, value_range=(0, 1))
+
+                # save_image(grid, os.path.join(self.logdir, 'images', f'train_{self.global_step:07d}.png'))
+
+                save_dir = os.path.join(self.log_dir, 'images')
+                if not os.path.exists(save_dir):
+                    os.makedirs(save_dir)
+                save_path = os.path.join(save_dir, f"*^train_step_{self.global_step}.png")
+                save_image(grid, save_path, normalize=True)
+                print(save_path)
+
             
             return loss
 
     
-    def _forward_pass(self, latents_noisy, cond_latents, t, encoder_hidden_states):
+    def _forward_pass(self, latents_noisy, cond_latents, t , encoder_hidden_states):
         """优化的前向传播"""
         #给定起始条件 coarse normal的潜在变量
         cross_attention_kwargs = dict(cond_lat=cond_latents)
 
         pred_latent = latents_noisy
-        t = t
 
         prev_noise = self.pipe.dino_unet_forward(
             self.pipe.unet,
             pred_latent,
             t,
             encoder_hidden_states = encoder_hidden_states,
-            #cross_attention_kwargs = cross_attention_kwargs,
+            cross_attention_kwargs = cross_attention_kwargs,
             return_dict = False,
         )[0]
 
@@ -663,11 +667,7 @@ class WrapperLightningModule(pl.LightningModule):
         return prev_noise
 
     
-    def check_tensor(self, tensor, name):
-        if torch.isnan(tensor).any():
-            print(f"{name} contains NaN!")
-        if torch.isinf(tensor).any():
-            print(f"{name} contains Inf!")
+
 
     def compute_loss(self, noise_pred, noise_gt):
 
@@ -703,11 +703,10 @@ class WrapperLightningModule(pl.LightningModule):
         """保存训练过程样本"""
         # print("`````````````",batch['input_images'].shape)
         # print("`````````````",output.shape)
-        output_image = torch.from_numpy(output.prediction).half().permute(0, 3, 1, 2).to(self.device)
-        output_image = (output_image + 1) / 2
+
         grid = torch.cat([
             batch['input_images'][:1], 
-            output_image[:1]
+            output[:1]
         ], dim=-1)
         save_path = os.path.join(self.log_dir, f"*^train_step_{self.global_step}.png")
         save_image(grid, save_path, normalize=True)
@@ -764,18 +763,21 @@ class WrapperLightningModule(pl.LightningModule):
         # 添加自动学习率缩放
         base_lr = self.learning_rate
         optimizer = torch.optim.AdamW(
-            self.parameters(), 
+            params=chain(
+                self.image_proj_model.parameters(),
+                self.adapter_modules.parameters()
+                ),
             lr=base_lr,
             fused=True  # 启用融合优化器
         )
         
         # 动态调整学习率
         scheduler = {
-            'scheduler': torch.optim.lr_scheduler.OneCycleLR(
+            'scheduler': torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
                 optimizer,
-                max_lr=base_lr,
-                total_steps=10000,
-                pct_start=0.3
+                T_0 = 500,
+                T_mult = 2,
+                eta_min = base_lr / 4,
             ),
             'interval': 'step'
         }
@@ -814,14 +816,23 @@ class WrapperLightningModule(pl.LightningModule):
         return latents
     
 
-    def get_v(self, x, noise, t):
-        def extract_into_tensor(a, t, x_shape):
+    def extract_into_tensor(a, t, x_shape):
             b, *_ = t.shape
             out = a.gather(-1, t)
             return out.reshape(b, *((1,) * (len(x_shape) - 1)))
+
+
+    def get_v(self, x, noise, t):
         return (
             extract_into_tensor(self.sqrt_alphas_cumprod, t, x.shape) * noise -
             extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, x.shape) * x
+        )
+
+
+    def predict_start_from_z_and_v(self, x_t, t, v):
+        return (
+            extract_into_tensor(self.sqrt_alphas_cumprod, t, x_t.shape) * x_t -
+            extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, x_t.shape) * v
         )
     
     
