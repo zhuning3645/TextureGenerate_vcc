@@ -21,6 +21,7 @@ from stablenormal.scheduler.heuristics_ddimsampler import HEURI_DDIMScheduler
 import warnings
 import math
 from itertools import chain
+import logging
 
 
 
@@ -194,8 +195,10 @@ class WrapperLightningModule(pl.LightningModule):
         # ip_adpter_weight: Optional[str] = "ip-adapter_sd15_fixed.safetensors",
     ):
         super().__init__()
-            
-         # 初始化配置参数
+
+        logging.getLogger("diffusers.models.attention_processor").setLevel(logging.ERROR)  
+
+        # 初始化配置参数
         self.local_cache_dir = local_cache_dir
         self.yoso_version = yoso_version
         self.diffusion_version = diffusion_version
@@ -324,11 +327,11 @@ class WrapperLightningModule(pl.LightningModule):
         self.image_proj_model=image_proj_model
         self.adapter_modules=adapter_modules
 
-        self.pipe.image_proj_model=self.image_proj_model
-        self.pipe.adapter_modules=self.adapter_modules
+        # self.pipe.image_proj_model=self.image_proj_model
+        # self.pipe.adapter_modules=self.adapter_modules
 
-        self.pipe.image_proj_model.requires_grad_(True)
-        self.pipe.adapter_modules.requires_grad_(True)
+        self.image_proj_model.requires_grad_(True)
+        self.adapter_modules.requires_grad_(True)
             
         # 日志目录
         self.log_dir = "training_logs"
@@ -353,8 +356,8 @@ class WrapperLightningModule(pl.LightningModule):
         
 
         df_model = DinoFeatureModel().type(torch.float16)
-        self.pipe.df_model = df_model.to(device)
-        self.df_model = self.pipe.df_model
+        self.df_model = df_model.to(device)
+        # self.df_model = self.pipe.df_model
 
 
 
@@ -472,66 +475,7 @@ class WrapperLightningModule(pl.LightningModule):
     #     # 对所有参数进行梯度裁剪，限制最大范数为1.0
     #     torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
 
-    def forward(self, latents, t, cond_latents, dino_features_ref):
-        #gt的latent 循环的次数 起始的条件 嵌入
 
-        #给定起始条件 coarse normal的潜在变量
-        cross_attention_kwargs = dict(cond_lat=cond_latents)
-
-        assert torch.isnan(latents).sum() == 0, print(latents)
-        assert torch.isnan(t).sum() == 0, print(t)
-        assert torch.isnan(dino_features_ref).sum() == 0, print(dino_features_ref)
-
-        # image_embeds = torch.randn(1, 1024, dtype=torch.float32).cuda() * 0.01
-        # ip_tokens = model(image_embeds)
-        # print("===============FP32 ip_tokens:================", ip_tokens, ip_tokens.max(),ip_tokens.min())
-
-        # 观察给定数据和随机生成的数据取值范围
-        #print("-------dino_features_ref-------",dino_features_ref.max(), dino_features_ref.min())
-        dino_randn = torch.randn_like(dino_features_ref)
-        #print("-------dino_randn-------", dino_randn.max(), dino_randn.min())
-        #dino_randn = dino_randn.float()
-        #dino_features_ref = dino_features_ref.float()
-        #ip_tokens = self.image_proj_model(dino_randn)
-        #ip_tokens = model(dino_features_ref)
-        
-
-        with torch.cuda.amp.autocast():
-            ip_tokens = self.pipe.model(dino_features_ref)
-
-
-        # ip_tokens1 = torch.randn_like(dino_features_ref)
-
-        ip_tokens = ip_tokens.half()
-
-        batch_size = ip_tokens.size(0)
-        print(f"ip_tokens:{ip_tokens.shape}")
-        # 根据bs扩展文本嵌入的维度
-        self.prompt_embeds = self.prompt_embeds.repeat(batch_size, 1, 1)
-        print(f"self.prompt_embeds:{self.prompt_embeds.shape}")
-
-        encoder_hidden_states = torch.cat([self.prompt_embeds, ip_tokens],dim=1)
-
-        # #encoder_hidden_states = torch.cat([self.prompt_embeds,dino_features_ref], dim = 1)
-        # self.check_tensor(ip_tokens, "ip_tokens")
-        # self.check_tensor(encoder_hidden_states, "encoder_hidden_states")
-
-        
-        prev_noise = self.pipe.dino_unet_forward(
-                self.pipe.unet,
-                latents,
-                t,
-                encoder_hidden_states=encoder_hidden_states,
-                return_dict=False,
-            )[0]  # [B,4,h,w]
-        # prev_noise = self.pipe.unet(
-        #         latents,
-        #         t,
-        #         encoder_hidden_states,
-        #     ).sample
-
-
-        return prev_noise
     
     def training_step(self, batch, batch_idx):
 
@@ -571,13 +515,13 @@ class WrapperLightningModule(pl.LightningModule):
             dino_features_ref = self.pipe.dino_controlnet.dino_controlnet_cond_embedding(dino_features_ref)
             # print(f"dino_features_ref:{dino_features_ref.shape}")# bs 320 96 96
             # 对dino encoder features应用线性层
-            dino_features_ref = self.pipe.df_model(dino_features_ref)
+            dino_features_ref = self.df_model(dino_features_ref)
 
             v_target = self.get_v(latents, noise, t).half()
 
 
             #使用dino encoder的特征生成tokens
-            ip_tokens = self.pipe.image_proj_model(dino_features_ref)
+            ip_tokens = self.image_proj_model(dino_features_ref)
             ip_tokens = ip_tokens.half()
             batch_size = ip_tokens.size(0)
             # 根据bs扩展文本嵌入的维度
@@ -588,7 +532,7 @@ class WrapperLightningModule(pl.LightningModule):
             torch.cuda.empty_cache()
             
             # 使用梯度累积 
-            prev_noise = self._forward_pass(latents_noisy, cond_latents, t, encoder_hidden_states)
+            prev_noise = self.forward(latents_noisy, cond_latents, t, encoder_hidden_states)
             loss, loss_dict = self.compute_loss(prev_noise, v_target)
 
             
@@ -612,42 +556,18 @@ class WrapperLightningModule(pl.LightningModule):
             lr = self.optimizers().param_groups[0]['lr']
             self.log('lr_abs', lr, prog_bar=True, logger=True, on_step=True, on_epoch=False)
 
-            #可视化保存（每1000步）
-        if self.global_step % 50 == 0 and self.global_rank == 0:
-            with torch.no_grad():
-                #预测起始latents、时间步、预测噪声
-                latents_pred = self.predict_start_from_z_and_v(latents_noisy, t, prev_noise)
 
-                latents = unscale_latents(latents_pred)
-                # 将 scaling_factor 转换为张量，并确保类型和设备匹配
-                self.pipe.vae.config.scaling_factor = torch.tensor(
-                    self.pipe.vae.config.scaling_factor,
-                    dtype=torch.float16,  # 强制使用 float16
-                    device=latents.device
-                )
 
-                # 确保 latents 是 float16
-                latents = latents.to(torch.float16)
-                images = unscale_image(self.pipe.vae.decode(latents / self.pipe.vae.config.scaling_factor, return_dict=False)[0])   # [-1, 1]
-                images = (images * 0.5 + 0.5).clamp(0, 1)
-                images = torch.cat([render_gt, images], dim=-2)
+        #可视化保存（每100 * accumulate_grad_batches步）
+        if self.global_step % 100 == 0 and self.global_rank == 0:
 
-                grid = make_grid(images, nrow=images.shape[0], normalize=True, value_range=(0, 1))
-
-                # save_image(grid, os.path.join(self.logdir, 'images', f'train_{self.global_step:07d}.png'))
-
-                save_dir = os.path.join(self.log_dir, 'images')
-                if not os.path.exists(save_dir):
-                    os.makedirs(save_dir)
-                save_path = os.path.join(save_dir, f"*^train_step_{self.global_step}.png")
-                save_image(grid, save_path, normalize=True)
-                print(save_path)
+            self._save_training_samples(latents_noisy, t, prev_noise, render_gt, input_image = image)
 
             
-            return loss
+        return loss
 
     
-    def _forward_pass(self, latents_noisy, cond_latents, t , encoder_hidden_states):
+    def forward(self, latents_noisy, cond_latents, t , encoder_hidden_states):
         """优化的前向传播"""
         #给定起始条件 coarse normal的潜在变量
         cross_attention_kwargs = dict(cond_lat=cond_latents)
@@ -667,7 +587,6 @@ class WrapperLightningModule(pl.LightningModule):
         return prev_noise
 
     
-
 
     def compute_loss(self, noise_pred, noise_gt):
 
@@ -698,18 +617,38 @@ class WrapperLightningModule(pl.LightningModule):
 
     
     
-    
-    def _save_training_samples(self, output, batch):
+    @torch.no_grad
+    def _save_training_samples(self, latents_noisy, t, prev_noise, render_gt, input_image):
         """保存训练过程样本"""
-        # print("`````````````",batch['input_images'].shape)
-        # print("`````````````",output.shape)
+        #预测起始latents、时间步、预测噪声
+        latents_pred = self.predict_start_from_z_and_v(latents_noisy, t, prev_noise)
 
-        grid = torch.cat([
-            batch['input_images'][:1], 
-            output[:1]
-        ], dim=-1)
-        save_path = os.path.join(self.log_dir, f"*^train_step_{self.global_step}.png")
+        # 使用训练网络预测的噪声给已经加噪的latents降噪
+        latents = unscale_latents(latents_pred)
+        # 将 scaling_factor 转换为张量，并确保类型和设备匹配
+        self.pipe.vae.config.scaling_factor = torch.tensor(
+            self.pipe.vae.config.scaling_factor,
+            dtype=torch.float16,  # 强制使用 float16
+            device=latents.device
+        )
+
+        # 确保 latents 是 float16
+        latents = latents.to(torch.float16)
+        images = unscale_image(self.pipe.vae.decode(latents / self.pipe.vae.config.scaling_factor, return_dict=False)[0])   # [-1, 1]
+        images = (images * 0.5 + 0.5).clamp(0, 1)
+        images = torch.cat([input_image, render_gt, images], dim=-2)
+
+        grid = make_grid(images, nrow=images.shape[0], normalize=True, value_range=(0, 1))
+
+        # save_image(grid, os.path.join(self.logdir, 'images', f'train_{self.global_step:07d}.png'))
+
+        save_path = os.path.join(self.logdir, 'images', f"*train_step_{self.global_step:07d}.png")
+        save_dir = os.path.join(self.logdir, 'images')
+        if not os.path.exists(save_dir):
+            os.makedirs(save_dir)
         save_image(grid, save_path, normalize=True)
+        
+
 
     def _save_validation_results(self, output, batch):
         """保存验证结果"""
@@ -783,25 +722,6 @@ class WrapperLightningModule(pl.LightningModule):
         }
         return [optimizer], [scheduler]
     
-
-    # def configure_optimizers(self):
-    #     lr = 1e-5
-    #     # 优化器配置
-    #     params = [
-    #         {"params": self.pipe.image_proj_model.parameters()},
-    #         #{"params": self.pipe.model.parameters()},
-    #     ]
-    #     optimizer = torch.optim.AdamW(params, lr = lr)
-    #     scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-    #         optimizer, 
-    #         T_0=3000, 
-    #         eta_min=lr/4
-    #     )
-    #     return {
-    #         'optimizer': optimizer,
-    #         'lr_scheduler': scheduler,
-    #         "gradient_clip_val": 1.0,
-    #     }
 
 
 
