@@ -23,7 +23,7 @@ data:
         ref_dir: ref_crops
         rgb_dir: rgb_images
         img_size: 768
-        num_ref: 1
+        num_ref: 3
         validation: false
     validation:
       target: src.data.building_texture.ValidationData

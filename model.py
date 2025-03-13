@@ -125,8 +125,6 @@ class ImageProjModel(torch.nn.Module):
         assert not torch.isnan(image_embeds).any(), "输入包含NaN"
 
         residual = self.residual_norm(image_embeds)
-
-
         # 报错的地方，试了残差结构还是没办法解决
 
         x = self.proj(residual)  # [B, cross_attention_dim * num_tokens]
@@ -135,15 +133,13 @@ class ImageProjModel(torch.nn.Module):
         residual_transformed = self.residual_proj(residual)
         x += residual_transformed
         
-        #print(f"proj output x type: {x.dtype}")
         #判断NaN断言
         assert torch.isnan(x).sum() == 0, print(x)
 
         x = self.act(x)
         x = x.reshape(-1, self.num_tokens, self.cross_attention_dim)  # [B, num_tokens, cross_attention_dim]
-
         x = self.norm(x)
-        
+    
         return x
     
 class AdapterModule(torch.nn.Module):
@@ -151,12 +147,15 @@ class AdapterModule(torch.nn.Module):
         super().__init__()
         # 为UNet的每个交叉注意力层添加适配层
         self.adapters = torch.nn.ModuleList()
+        
         for block in unet.down_blocks + unet.up_blocks:
             if hasattr(block, "attentions"):
                 for attn in block.attentions:
                     for transformer_block in attn.transformer_blocks:
+
                         # 注入适配层到交叉注意力模块
                         adapter = torch.nn.Sequential(
+                            torch.nn.LayerNorm(adapter_dim),
                             torch.nn.Linear(transformer_block.attn2.to_k.in_features, adapter_dim),
                             torch.nn.ReLU(),
                             torch.nn.Linear(adapter_dim, transformer_block.attn2.to_k.in_features)
@@ -203,7 +202,7 @@ class WrapperLightningModule(pl.LightningModule):
         self.yoso_version = yoso_version
         self.diffusion_version = diffusion_version
         # self.ip_adpter_weight = ip_adpter_weight
-        self.num_timesteps = 50
+        self.num_timesteps = 1000
         self.drop_cond_prob = drop_cond_prob
         self.automatic_optimization = True
         self.prompt = prompt
@@ -358,6 +357,7 @@ class WrapperLightningModule(pl.LightningModule):
         df_model = DinoFeatureModel().type(torch.float16)
         self.df_model = df_model.to(device)
         # self.df_model = self.pipe.df_model
+
 
 
 
@@ -559,9 +559,9 @@ class WrapperLightningModule(pl.LightningModule):
 
 
         #可视化保存（每100 * accumulate_grad_batches步）
-        if self.global_step % 100 == 0 and self.global_rank == 0:
+        if self.global_step % 25 == 0 and self.global_rank == 0:
 
-            self._save_training_samples(latents_noisy, t, prev_noise, render_gt, input_image = image)
+            self._save_training_samples(latents_noisy, t, prev_noise, render_gt, input_image = image, ref_image = ref_normal)
 
             
         return loss
@@ -618,7 +618,7 @@ class WrapperLightningModule(pl.LightningModule):
     
     
     @torch.no_grad
-    def _save_training_samples(self, latents_noisy, t, prev_noise, render_gt, input_image):
+    def _save_training_samples(self, latents_noisy, t, prev_noise, render_gt, input_image, ref_image):
         """保存训练过程样本"""
         #预测起始latents、时间步、预测噪声
         latents_pred = self.predict_start_from_z_and_v(latents_noisy, t, prev_noise)
@@ -636,7 +636,10 @@ class WrapperLightningModule(pl.LightningModule):
         latents = latents.to(torch.float16)
         images = unscale_image(self.pipe.vae.decode(latents / self.pipe.vae.config.scaling_factor, return_dict=False)[0])   # [-1, 1]
         images = (images * 0.5 + 0.5).clamp(0, 1)
-        images = torch.cat([input_image, render_gt, images], dim=-2)
+        
+        group1 = torch.cat([ref_image, input_image], dim=-1) 
+        group2 = torch.cat([render_gt, images], dim=-1)
+        images = torch.cat([group1, group2], dim=-2)
 
         grid = make_grid(images, nrow=images.shape[0], normalize=True, value_range=(0, 1))
 
@@ -707,6 +710,7 @@ class WrapperLightningModule(pl.LightningModule):
                 self.adapter_modules.parameters()
                 ),
             lr=base_lr,
+            weight_decay=1e-2,
             fused=True  # 启用融合优化器
         )
         
