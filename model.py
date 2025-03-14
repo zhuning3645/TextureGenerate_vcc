@@ -102,45 +102,26 @@ class ImageProjModel(torch.nn.Module):
         self.cross_attention_dim = cross_attention_dim
         self.num_tokens = num_tokens
 
-        # self.proj = torch.nn.Linear(clip_embed_dim, cross_attention_dim * num_tokens)
-        # self.norm = torch.nn.LayerNorm(cross_attention_dim)
-        # 修改1：使用 Xavier 初始化并降低增益 (gain=0.1)
-        self.proj = torch.nn.Linear(clip_embed_dim, cross_attention_dim * num_tokens).float()
-        torch.nn.init.kaiming_normal_(self.proj.weight, mode='fan_out',nonlinearity='relu')  # 缩小初始权重范围
-        torch.nn.init.zeros_(self.proj.bias)  # 初始化偏置为0
-        
-        # 修改2：在归一化前添加激活函数（如 GELU）
-        self.act = torch.nn.GELU()  # 防止数值线性增长
-        self.norm = torch.nn.LayerNorm(cross_attention_dim, eps = 1e-3)
+        self.generator = None
 
-        self.proj_norm = torch.nn.LayerNorm(cross_attention_dim * num_tokens)
+        self.proj = torch.nn.Linear(clip_embed_dim, self.num_tokens * cross_attention_dim)
+        self.norm = torch.nn.LayerNorm(cross_attention_dim)
 
-        self.residual_norm = torch.nn.LayerNorm(cross_attention_dim)
-        # 定义用于调整残差路径维度的线性变换
-        self.residual_proj = nn.Linear(1024, 4096)
         
     def forward(self, image_embeds):
         # image_embeds: [B, clip_embed_dim]
 
         assert not torch.isnan(image_embeds).any(), "输入包含NaN"
 
-        residual = self.residual_norm(image_embeds)
-        # 报错的地方，试了残差结构还是没办法解决
-
-        x = self.proj(residual)  # [B, cross_attention_dim * num_tokens]
-        x = self.proj_norm(x)
-        #print(x.shape) # 1 4096
-        residual_transformed = self.residual_proj(residual)
-        x += residual_transformed
         
-        #判断NaN断言
-        assert torch.isnan(x).sum() == 0, print(x)
-
-        x = self.act(x)
-        x = x.reshape(-1, self.num_tokens, self.cross_attention_dim)  # [B, num_tokens, cross_attention_dim]
-        x = self.norm(x)
+        embeds = image_embeds
+        clip_extra_context_tokens = self.proj(embeds)
+        clip_extra_context_tokens = clip_extra_context_tokens.reshape(
+            -1, self.num_tokens, self.cross_attention_dim
+        )
+        clip_extra_context_tokens = self.norm(clip_extra_context_tokens)
     
-        return x
+        return clip_extra_context_tokens
     
 class AdapterModule(torch.nn.Module):
     def __init__(self, unet, adapter_dim=64):
@@ -515,18 +496,18 @@ class WrapperLightningModule(pl.LightningModule):
             dino_features_ref = self.pipe.dino_controlnet.dino_controlnet_cond_embedding(dino_features_ref)
             # print(f"dino_features_ref:{dino_features_ref.shape}")# bs 320 96 96
             # 对dino encoder features应用线性层
-            dino_features_ref = self.df_model(dino_features_ref)
+            dino_features_ref = self.df_model(dino_features_ref) # bs 1024 
 
             v_target = self.get_v(latents, noise, t).half()
 
 
             #使用dino encoder的特征生成tokens
-            ip_tokens = self.image_proj_model(dino_features_ref)
+            ip_tokens = self.image_proj_model(dino_features_ref) # bs 4 1024
             ip_tokens = ip_tokens.half()
             batch_size = ip_tokens.size(0)
             # 根据bs扩展文本嵌入的维度
-            self.prompt_embeds = self.prompt_embeds.expand(batch_size, -1, -1)
-            encoder_hidden_states = torch.cat([self.prompt_embeds, ip_tokens],dim=1)
+            self.prompt_embeds = self.prompt_embeds.expand(batch_size, -1, -1) # bs 77 1024
+            encoder_hidden_states = torch.cat([self.prompt_embeds, ip_tokens],dim=1) # bs 81 1024
 
             # 内存优化：释放不需要的缓存
             torch.cuda.empty_cache()
@@ -574,11 +555,22 @@ class WrapperLightningModule(pl.LightningModule):
 
         pred_latent = latents_noisy
 
+        # down_block_res_samples, mid_block_res_sample = self.pipe.controlnet(
+        #         cond_latents,
+        #         t,
+        #         encoder_hidden_states=encoder_hidden_states,
+        #         conditioning_scale=1.0,
+        #         guess_mode=False,
+        #         return_dict=False,
+        #     )
+
         prev_noise = self.pipe.dino_unet_forward(
             self.pipe.unet,
             pred_latent,
             t,
             encoder_hidden_states = encoder_hidden_states,
+            # down_block_additional_residuals = down_block_res_samples,
+            # mid_block_additional_residual = mid_block_res_sample,
             cross_attention_kwargs = cross_attention_kwargs,
             return_dict = False,
         )[0]
