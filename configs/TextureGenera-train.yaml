@@ -1,5 +1,5 @@
 model:
-  base_learning_rate: 1.0e-05
+  base_learning_rate: 1.0e-06
   target: model.WrapperLightningModule
   params:
     local_cache_dir: weights

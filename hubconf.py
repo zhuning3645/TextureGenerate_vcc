@@ -107,7 +107,6 @@ class Predictor:
             init_latents = None
         
         print(f"Current model: {self.model.__class__.__name__}")
-        print("//////////////////",init_latents)
 
         
         pipe_out = self.model(
@@ -115,7 +114,6 @@ class Predictor:
                             ref_normal, 
                             match_input_resolution=True, 
                             latents=init_latents,
-                            ip_adapter_image_embeds = None
                         )
 
         # print('pipe_out',pipe_out)
@@ -144,7 +142,6 @@ class Predictor:
 
 def StableNormal(local_cache_dir: Optional[str] = None, device="cuda:0", 
                  yoso_version='yoso-normal-v0-3', diffusion_version='stable-normal-v0-1',
-                 ip_adpter_weight: Optional[str] = "ip-adapter_sd15_fixed.safetensors",
                  ref_normal: Optional[Image.Image] = None) -> Predictor:
     """Load the StableNormal pipeline and return a Predictor instance."""
     # 对模型进行初始化
@@ -164,13 +161,14 @@ def StableNormal(local_cache_dir: Optional[str] = None, device="cuda:0",
                                                                               beta_schedule="scaled_linear"),
                                                 low_cpu_mem_usage=False, ignore_mismatched_sizes=True)
 
-    print("process1^^^^^^^^^^^^^^^^^^^^^^^^")
-    # 调用方法
-    pipe.load_ip_adapter("/data/shared/TextureGeneration/IP-Adapter/IP-Adapter",
-                     subfolder="models",
-                     weight_name=ip_adpter_weight,
-                     local_files_only=True,
-                     low_cpu_mem_usage=False)
+
+    # 加载预训练权重
+    ckpt_path = "/data/shared/TextureGeneration/Texture/logs/TextureGenera-train-exp86/checkpoints/step=00002000.ckpt"
+    pipe.load_ip_adapter(ckpt_path)
+
+    # state_dict = torch.load(ckpt_path)
+    # # 提取模型权重
+    # model_weights = state_dict["state_dict"]
     
     pipe.x_start_pipeline = x_start_pipeline
     pipe.to(device)
@@ -216,10 +214,12 @@ def _test_run():
     # 检查 ref_normal 是否为 None
     if args.ref_normal:
         ref_normal = Image.open(args.ref_normal)
+        print(f"ref_normal:{ref_normal}")
         with torch.inference_mode():
             normal_image = predictor(image, ref_normal) 
     else:
         ref_normal = None
+        # print("----------------没有正常输入ref图片--------------")
         with torch.inference_mode():
             normal_image = predictor(image) 
 

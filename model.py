@@ -9,7 +9,7 @@ from torchvision import transforms
 from PIL import Image, ImageOps
 from torch.nn.functional import interpolate
 import torch.nn.functional as F
-from diffusers import ControlNetModel, AutoencoderKL, UniPCMultistepScheduler, DDPMScheduler
+from diffusers import ControlNetModel, AutoencoderKL, UniPCMultistepScheduler, DDPMScheduler, UNet2DConditionModel
 from diffusers.models.attention_processor import IPAdapterAttnProcessor2_0 as IPAttnProcessor, AttnProcessor2_0 as AttnProcessor
 import torch.nn as nn
 from transformers import CLIPImageProcessor, CLIPTextModel, CLIPTokenizer
@@ -22,6 +22,7 @@ import warnings
 import math
 from itertools import chain
 import logging
+from pipe import RefOnlyNoisedUNet
 
 
 
@@ -183,7 +184,7 @@ class WrapperLightningModule(pl.LightningModule):
         self.yoso_version = yoso_version
         self.diffusion_version = diffusion_version
         # self.ip_adpter_weight = ip_adpter_weight
-        self.num_timesteps = 1000
+        self.num_timesteps = 500
         self.drop_cond_prob = drop_cond_prob
         self.automatic_optimization = True
         self.prompt = prompt
@@ -225,6 +226,14 @@ class WrapperLightningModule(pl.LightningModule):
             ignore_mismatched_sizes=True
         )
 
+        train_sched = DDPMScheduler.from_config(self.pipe.scheduler.config)
+        # if isinstance(self.pipe.unet, UNet2DConditionModel):
+        #     self.pipe.unet = RefOnlyNoisedUNet(self.pipe.unet, train_sched, self.pipe.scheduler)
+
+        self.train_scheduler = train_sched
+        self.unet = self.pipe.unet
+
+
         #初始化pipeline
         self.x_start_pipeline.to(device)
         self.pipe.to(device)
@@ -238,9 +247,9 @@ class WrapperLightningModule(pl.LightningModule):
         self.sqrt_alphas_cumprod.requires_grad_(False)
         self.sqrt_one_minus_alphas_cumprod.requires_grad_(False)
 
-        # 在类初始化或代码开始处添加
-        warnings.filterwarnings("ignore", 
-            message=".*cross_attention_kwargs.*are not expected by.*and will be ignored.*")
+        # # 在类初始化或代码开始处添加
+        # warnings.filterwarnings("ignore", 
+        #     message=".*cross_attention_kwargs.*are not expected by.*and will be ignored.*")
 
 
         # 加载IP适配器
@@ -295,7 +304,7 @@ class WrapperLightningModule(pl.LightningModule):
         
         self.pipe.unet.set_attn_processor(attn_procs)
 
-        #adapter_modules = torch.nn.ModuleList(self.pipe.unet.attn_processors.values()).to(device)
+        # adapter_modules = torch.nn.ModuleList(self.pipe.unet.attn_processors.values()).to(device)
         attn_processors = self.pipe.unet.attn_processors.values()
         wrapped_processors = [AttnProcessorWrapper(proc) if not isinstance(proc, torch.nn.Module) else proc for proc in attn_processors]
         adapter_modules = torch.nn.ModuleList(wrapped_processors).to(device)
@@ -307,8 +316,8 @@ class WrapperLightningModule(pl.LightningModule):
         self.image_proj_model=image_proj_model
         self.adapter_modules=adapter_modules
 
-        # self.pipe.image_proj_model=self.image_proj_model
-        # self.pipe.adapter_modules=self.adapter_modules
+        self.pipe.image_proj_model=self.image_proj_model
+        self.pipe.adapter_modules=self.adapter_modules
 
         self.image_proj_model.requires_grad_(True)
         self.adapter_modules.requires_grad_(True)
@@ -445,17 +454,6 @@ class WrapperLightningModule(pl.LightningModule):
 
         return lrm_generator_input, render_gt
     
-    #试了梯度裁剪 也没有效果
-    # def configure_gradient_clipping(
-    #     self,
-    #     optimizer,
-    #     optimizer_idx,
-    #     gradient_clip_val=None,
-    #     gradient_clip_algorithm=None,
-    # ):
-    #     # 对所有参数进行梯度裁剪，限制最大范数为1.0
-    #     torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
-
 
     
     def training_step(self, batch, batch_idx):
@@ -476,12 +474,11 @@ class WrapperLightningModule(pl.LightningModule):
 
             # classifier-free guidance
             if np.random.rand() < self.drop_cond_prob:
-                cond_latents = self.encode_condition_image(torch.zeros_like(image))
+                cond_latents = self.encode_condition_image(torch.zeros_like(image))# [1, 4, 96, 96]
             else:
                 cond_latents = self.encode_condition_image(image)
             
-            train_sched = DDPMScheduler.from_config(self.pipe.scheduler.config)
-            self.train_scheduler = train_sched
+            print(f"cond_latents:{cond_latents.shape}")
             
             #生成latenst_noisy的作为预测过程的起始量  
             latents = self.encode_target_images(render_gt)
@@ -574,6 +571,16 @@ class WrapperLightningModule(pl.LightningModule):
             cross_attention_kwargs = cross_attention_kwargs,
             return_dict = False,
         )[0]
+
+        # prev_noise = self.pipe.unet(
+        #     pred_latent,
+        #     t,
+        #     encoder_hidden_states = encoder_hidden_states,
+        #     # down_block_additional_residuals = down_block_res_samples,
+        #     # mid_block_additional_residual = mid_block_res_sample,
+        #     cross_attention_kwargs = cross_attention_kwargs,
+        #     return_dict = False,
+        # )[0]
 
 
         return prev_noise
@@ -699,7 +706,8 @@ class WrapperLightningModule(pl.LightningModule):
         optimizer = torch.optim.AdamW(
             params=chain(
                 self.image_proj_model.parameters(),
-                self.adapter_modules.parameters()
+                self.adapter_modules.parameters(),
+                # self.unet.parameters(),
                 ),
             lr=base_lr,
             weight_decay=1e-2,

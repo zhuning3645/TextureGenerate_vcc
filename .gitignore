@@ -5,3 +5,6 @@ weights
 logs/
 data/
 dinov2
+image/
+output/
+test.py
