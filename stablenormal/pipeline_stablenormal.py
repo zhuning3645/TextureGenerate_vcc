@@ -66,6 +66,7 @@ import torch.nn.functional as F
 import torchvision.transforms as transforms
 
 import pdb
+import matplotlib.pyplot as plt
 
 
 
@@ -698,26 +699,15 @@ class StableNormalPipeline(StableDiffusionControlNetPipeline, IPAdapterMixin):
             image, processing_resolution, resample_method_input, device, dtype
         )  # [N,3,PPH,PPW]
 
-
         image_latent, gaus_noise = self.prepare_latents(
             image, latents, generator, ensemble_size, batch_size
         )  # [N,4,h,w], [N,4,h,w]
 
-        
 
-        
+        # predictor = self.x_start_pipeline(image, latents=gaus_noise, 
+        #                             processing_resolution=processing_resolution, skip_preprocess=True)
+        # x_start_latent = predictor.latent
 
-        # ref_normal, padding_normal, original_resolution_normal = self.image_processor.preprocess(
-        #     ref_normal, processing_resolution, resample_method_input, device, dtype
-        # )  # [N,3,PPH,PPW]
-
-
-        predictor = self.x_start_pipeline(image, latents=gaus_noise, 
-                                    processing_resolution=processing_resolution, skip_preprocess=True)
-        x_start_latent = predictor.latent
-
-
-        print("latents=====", image)
 
         '''
             pseudo code
@@ -778,18 +768,13 @@ class StableNormalPipeline(StableDiffusionControlNetPipeline, IPAdapterMixin):
             self.negative_prompt_embeds = negative_prompt_embeds
 
 
-
         # 5. dino guider features obtaining
         ## TODO different case-1
-        print("image 形状:", image.shape)  # [1, 3, 768, 768]
-        latent = image
+
         dino_features = self.prior(image)
         dino_features = dino_features.type(torch.float16)
-        # 提取出原始特征
         dino_features = self.dino_controlnet.dino_controlnet_cond_embedding(dino_features)
-        # *********  DINO特征与ControlNet的条件嵌入进行结合 ****************
         # dino_features = self.match_noisy(dino_features, x_start_latent)
-        # 将DINO特征与起始潜在变量进行形状匹配
 
 
         del (
@@ -803,23 +788,16 @@ class StableNormalPipeline(StableDiffusionControlNetPipeline, IPAdapterMixin):
 
         image_prompt_embeds, uncond_image_prompt_embeds = self.get_image_embeds(
             pil_image=ref_normal, clip_image_embeds=None
-        )
-        print("ref_normal 形状:", image_prompt_embeds.shape)
+        )# 1 4 1024
+
         # bs_embed, seq_len, _ = image_prompt_embeds.shape
         # image_prompt_embeds = image_prompt_embeds.repeat(1, num_samples, 1)
         # image_prompt_embeds = image_prompt_embeds.view(bs_embed * num_samples, seq_len, -1)
         # uncond_image_prompt_embeds = uncond_image_prompt_embeds.repeat(1, num_samples, 1)
         # uncond_image_prompt_embeds = uncond_image_prompt_embeds.view(bs_embed * num_samples, seq_len, -1)
 
-        print("ref_normal 形状:", image_prompt_embeds.shape)  # 期望格式：[B, C, H, W]
-        
-        print(image_prompt_embeds)
-
-        print("ref_normal 形状:", self.prompt_embeds.shape) 
-
+        # bs 4 1024 + bs 77 1024 = bs 81 1024
         encoder_hidden_states = torch.cat([self.prompt_embeds, image_prompt_embeds], dim = 1)
-        # encoder_hidden_states = encoder_hidden_states.unsqueeze(0)
-        # print("ref_normal 形状:", encoder_hidden_states.shape) 
 
         # 7. denoise sampling, using heuritic sampling proposed by Ye.
 
@@ -829,11 +807,10 @@ class StableNormalPipeline(StableDiffusionControlNetPipeline, IPAdapterMixin):
         cond_scale = controlnet_conditioning_scale
         
 
-        # latent = torch.cat([latent, torch.zeros_like(latent[:, :1])], dim=1)
-        latent = self.encode_condition_image(latent)
-        pred_latent = latent
+        # latent = self.encode_condition_image(latent)
+        pred_latent = image_latent
 
-        print("=========",x_start_latent.shape)
+
         print("=========",pred_latent.shape)
 
         cur_step = 0
@@ -852,7 +829,7 @@ class StableNormalPipeline(StableDiffusionControlNetPipeline, IPAdapterMixin):
         pred_latents = []
 
         # Denoising loop
-        last_pred_latent = x_start_latent
+        # last_pred_latent = x_start_latent
 
         for (t, prev_t) in self.progress_bar(zip(self.scheduler.timesteps,self.scheduler.prev_timesteps), leave=False, desc="Diffusion steps..."):
 

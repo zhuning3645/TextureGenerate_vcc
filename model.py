@@ -464,7 +464,7 @@ class WrapperLightningModule(pl.LightningModule):
             image = model_inputs['images']
             ref_normal = model_inputs['ref_normals']
 
-            image = image.squeeze(1)  
+            image = image.squeeze(1)  # 1 3 768 768
             ref_normal = ref_normal.squeeze(1)
             render_gt = render_gt.squeeze(1)
 
@@ -472,26 +472,29 @@ class WrapperLightningModule(pl.LightningModule):
             B = image.shape[0]
             t = torch.randint(0, self.num_timesteps, size=(B,)).long().to(self.device)
 
+            latents, generator = None, None
             # classifier-free guidance
             if np.random.rand() < self.drop_cond_prob:
-                cond_latents = self.encode_condition_image(torch.zeros_like(image))# [1, 4, 96, 96]
+                cond_latents, gaus_noise = self.pipe.prepare_latents(
+                    torch.zeros_like(image), latents, generator,  ensemble_size = 1, batch_size = 1
+                )# [1, 4, 96, 96]
             else:
-                cond_latents = self.encode_condition_image(image)
+                cond_latents, gaus_noise = self.pipe.prepare_latents(
+                    image, latents, generator, ensemble_size = 1, batch_size = 1
+                )# [N,4,h,w], [N,4,h,w]
             
-            print(f"cond_latents:{cond_latents.shape}")
-            
+
             #生成latenst_noisy的作为预测过程的起始量  
             latents = self.encode_target_images(render_gt)
             noise = torch.randn_like(latents)
             latents_noisy = self.train_scheduler.add_noise(latents, noise, t)
         
-
             #对ref_normal使用dino encoder 生成features
             ref_normal = ref_normal.to(dtype=next(self.pipe.prior.parameters()).dtype)
             dino_features_ref = self.pipe.prior(ref_normal)
             dino_features_ref = dino_features_ref.type(torch.float16)
             dino_features_ref = self.pipe.dino_controlnet.dino_controlnet_cond_embedding(dino_features_ref)
-            # print(f"dino_features_ref:{dino_features_ref.shape}")# bs 320 96 96
+            # bs 320 96 96
             # 对dino encoder features应用线性层
             dino_features_ref = self.df_model(dino_features_ref) # bs 1024 
 
