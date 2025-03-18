@@ -9,7 +9,7 @@ from torchvision import transforms
 from PIL import Image, ImageOps
 from torch.nn.functional import interpolate
 import torch.nn.functional as F
-from diffusers import ControlNetModel, AutoencoderKL, UniPCMultistepScheduler, DDPMScheduler, UNet2DConditionModel
+from diffusers import ControlNetModel, AutoencoderKL, UniPCMultistepScheduler, DDPMScheduler
 from diffusers.models.attention_processor import IPAdapterAttnProcessor2_0 as IPAttnProcessor, AttnProcessor2_0 as AttnProcessor
 import torch.nn as nn
 from transformers import CLIPImageProcessor, CLIPTextModel, CLIPTokenizer
@@ -147,8 +147,6 @@ class AdapterModule(torch.nn.Module):
                         for param in transformer_block.attn2.parameters():
                             param.requires_grad = False
                         
-
-
 class AttnProcessorWrapper(torch.nn.Module):
     def __init__(self, processor):
         super().__init__()
@@ -156,8 +154,6 @@ class AttnProcessorWrapper(torch.nn.Module):
 
     def forward(self, *args, **kwargs):
         return self.processor(*args, **kwargs)
-
-
 
 
 # 创建 LightningModule 作为封装器
@@ -231,8 +227,7 @@ class WrapperLightningModule(pl.LightningModule):
         #     self.pipe.unet = RefOnlyNoisedUNet(self.pipe.unet, train_sched, self.pipe.scheduler)
 
         self.train_scheduler = train_sched
-        self.unet = self.pipe.unet
-
+        # self.unet = self.pipe.unet
 
         #初始化pipeline
         self.x_start_pipeline.to(device)
@@ -251,7 +246,6 @@ class WrapperLightningModule(pl.LightningModule):
         # warnings.filterwarnings("ignore", 
         #     message=".*cross_attention_kwargs.*are not expected by.*and will be ignored.*")
 
-
         # 加载IP适配器
         # self.pipe.load_ip_adapter(
         #     "/data/shared/TextureGeneration/IP-Adapter/IP-Adapter",
@@ -268,7 +262,6 @@ class WrapperLightningModule(pl.LightningModule):
         # ).float().cuda().to(device)
         image_proj_model = ImageProjModel().cuda()
         
-
         # init adapter modules
         attn_procs = {}
         unet_sd = self.pipe.unet.state_dict()
@@ -310,8 +303,6 @@ class WrapperLightningModule(pl.LightningModule):
         adapter_modules = torch.nn.ModuleList(wrapped_processors).to(device)
         
 
-
-
         # 步骤2: 创建IPAdapter实例
         self.image_proj_model=image_proj_model
         self.adapter_modules=adapter_modules
@@ -342,15 +333,9 @@ class WrapperLightningModule(pl.LightningModule):
                 )
                 self.prompt_embeds = prompt_embeds
         
-        
-
         df_model = DinoFeatureModel().type(torch.float16)
         self.df_model = df_model.to(device)
         # self.df_model = self.pipe.df_model
-
-
-
-
 
         # 验证可训练参数数量
         trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
@@ -485,9 +470,10 @@ class WrapperLightningModule(pl.LightningModule):
             
 
             #生成latenst_noisy的作为预测过程的起始量  
-            latents = self.encode_target_images(render_gt)
-            noise = torch.randn_like(latents)
-            latents_noisy = self.train_scheduler.add_noise(latents, noise, t)
+            latents_gt, gaus_noise_gt = self.pipe.prepare_latents(
+                render_gt, latents, generator, ensemble_size = 1, batch_size = 1)
+            noise = torch.randn_like(latents_gt)
+            latents_noisy = self.train_scheduler.add_noise(latents_gt, noise, t)
         
             #对ref_normal使用dino encoder 生成features
             ref_normal = ref_normal.to(dtype=next(self.pipe.prior.parameters()).dtype)
@@ -498,8 +484,7 @@ class WrapperLightningModule(pl.LightningModule):
             # 对dino encoder features应用线性层
             dino_features_ref = self.df_model(dino_features_ref) # bs 1024 
 
-            v_target = self.get_v(latents, noise, t).half()
-
+            v_target = self.get_v(latents_gt, noise, t).half()
 
             #使用dino encoder的特征生成tokens
             ip_tokens = self.image_proj_model(dino_features_ref) # bs 4 1024
@@ -507,7 +492,7 @@ class WrapperLightningModule(pl.LightningModule):
             batch_size = ip_tokens.size(0)
             # 根据bs扩展文本嵌入的维度
             self.prompt_embeds = self.prompt_embeds.expand(batch_size, -1, -1) # bs 77 1024
-            encoder_hidden_states = torch.cat([self.prompt_embeds, ip_tokens],dim=1) # bs 81 1024
+            encoder_hidden_states = torch.cat([self.prompt_embeds, ip_tokens], dim=1) # bs 81 1024
 
             # 内存优化：释放不需要的缓存
             torch.cuda.empty_cache()
@@ -516,7 +501,6 @@ class WrapperLightningModule(pl.LightningModule):
             prev_noise = self.forward(latents_noisy, cond_latents, t, encoder_hidden_states)
             loss, loss_dict = self.compute_loss(prev_noise, v_target)
 
-            
             # 日志记录
             self.log_dict(
                 loss_dict,
@@ -537,13 +521,9 @@ class WrapperLightningModule(pl.LightningModule):
             lr = self.optimizers().param_groups[0]['lr']
             self.log('lr_abs', lr, prog_bar=True, logger=True, on_step=True, on_epoch=False)
 
-
-
         #可视化保存（每100 * accumulate_grad_batches步）
         if self.global_step % 25 == 0 and self.global_rank == 0:
-
             self._save_training_samples(latents_noisy, t, prev_noise, render_gt, input_image = image, ref_image = ref_normal)
-
             
         return loss
 
@@ -585,10 +565,8 @@ class WrapperLightningModule(pl.LightningModule):
         #     return_dict = False,
         # )[0]
 
-
         return prev_noise
 
-    
 
     def compute_loss(self, noise_pred, noise_gt):
 
@@ -600,7 +578,6 @@ class WrapperLightningModule(pl.LightningModule):
         loss_dict.update({f'{prefix}/loss':loss})
         
         return loss, loss_dict
-
 
 
     @torch.no_grad
@@ -617,8 +594,7 @@ class WrapperLightningModule(pl.LightningModule):
         # 保存结果
         self._save_validation_results(render_images, batch)
 
-    
-    
+
     @torch.no_grad
     def _save_training_samples(self, latents_noisy, t, prev_noise, render_gt, input_image, ref_image):
         """保存训练过程样本"""
@@ -636,8 +612,12 @@ class WrapperLightningModule(pl.LightningModule):
 
         # 确保 latents 是 float16
         latents = latents.to(torch.float16)
-        images = unscale_image(self.pipe.vae.decode(latents / self.pipe.vae.config.scaling_factor, return_dict=False)[0])   # [-1, 1]
-        images = (images * 0.5 + 0.5).clamp(0, 1)
+
+        prediction = self.pipe.decode_prediction(latents)
+        images = (prediction.clip(-1, 1) + 1) / 2
+
+        # images = unscale_image(self.pipe.vae.decode(latents / self.pipe.vae.config.scaling_factor, return_dict=False)[0])   # [-1, 1]
+        # images = (images * 0.5 + 0.5).clamp(0, 1)
         
         group1 = torch.cat([ref_image, input_image], dim=-1) 
         group2 = torch.cat([render_gt, images], dim=-1)
@@ -663,14 +643,6 @@ class WrapperLightningModule(pl.LightningModule):
         for i, (img, normal) in enumerate(zip(batch['input_images'], output['generated_normals'])):
             save_image(normal, os.path.join(val_dir, f"val_{self.current_epoch}_{i}.png"))
 
-    # @torch.no_grad()
-    # def encode_condition_image(self, images):
-    #     dtype = next(self.pipe.vae.parameters()).dtype
-    #     image_pil = [v2.functional.to_pil_image(images[i]) for i in range(images.shape[0])]
-    #     image_pt = self.feature_extractor(images=image_pil, return_tensors="pt").pixel_values
-    #     image_pt = image_pt.to(device=self.device, dtype=dtype)
-    #     latents = self.pipe.vae.encode(image_pt).latent_dist.sample()
-    #     return latents
 
     def encode_condition_image(self, images):
         dtype = next(self.pipe.vae.parameters()).dtype

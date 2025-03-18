@@ -63,10 +63,8 @@ from src.attention_processor import CNAttnProcessor2_0 as CNAttnProcessor
 
 import torch.nn as nn
 import torch.nn.functional as F
-import torchvision.transforms as transforms
 
-import pdb
-import matplotlib.pyplot as plt
+
 
 
 
@@ -704,17 +702,9 @@ class StableNormalPipeline(StableDiffusionControlNetPipeline, IPAdapterMixin):
         )  # [N,4,h,w], [N,4,h,w]
 
 
-        # predictor = self.x_start_pipeline(image, latents=gaus_noise, 
-        #                             processing_resolution=processing_resolution, skip_preprocess=True)
-        # x_start_latent = predictor.latent
-
-
-        '''
-            pseudo code
-        '''
-        # x0_start_latent = self.vae(ref_normal.upsample())
-        # x_start_latent = self.add_noise(x0_start_latent, t)
-    
+        predictor = self.x_start_pipeline(image, latents=gaus_noise, 
+                                    processing_resolution=processing_resolution, skip_preprocess=True)
+        x_start_latent = predictor.latent
 
         # 1. Check inputs.
         num_images = self.check_inputs(
@@ -732,9 +722,6 @@ class StableNormalPipeline(StableDiffusionControlNetPipeline, IPAdapterMixin):
             output_type,
             output_uncertainty,
         )
-
-        self._interrupt = False
-
 
         # 2. Prepare empty text conditioning.
         # Model invocation: self.tokenizer, self.text_encoder.
@@ -770,12 +757,9 @@ class StableNormalPipeline(StableDiffusionControlNetPipeline, IPAdapterMixin):
 
         # 5. dino guider features obtaining
         ## TODO different case-1
-
         dino_features = self.prior(image)
-        dino_features = dino_features.type(torch.float16)
         dino_features = self.dino_controlnet.dino_controlnet_cond_embedding(dino_features)
         # dino_features = self.match_noisy(dino_features, x_start_latent)
-
 
         del (
                 image,
@@ -805,13 +789,8 @@ class StableNormalPipeline(StableDiffusionControlNetPipeline, IPAdapterMixin):
         self.scheduler.set_timesteps(num_inference_steps, t_start=t_start,device=device)
 
         cond_scale = controlnet_conditioning_scale
-        
-
-        # latent = self.encode_condition_image(latent)
         pred_latent = image_latent
-
-
-        print("=========",pred_latent.shape)
+        # 这里直接使用image_latent作为cond_latent, 原版是x_start_latent
 
         cur_step = 0
 
@@ -829,8 +808,7 @@ class StableNormalPipeline(StableDiffusionControlNetPipeline, IPAdapterMixin):
         pred_latents = []
 
         # Denoising loop
-        # last_pred_latent = x_start_latent
-
+        last_pred_latent = pred_latent
         for (t, prev_t) in self.progress_bar(zip(self.scheduler.timesteps,self.scheduler.prev_timesteps), leave=False, desc="Diffusion steps..."):
 
             #_dino_down_block_res_samples = [dino_down_block_res_sample for dino_down_block_res_sample in dino_down_block_res_samples]  # copy, avoid repeat quiery
@@ -852,7 +830,7 @@ class StableNormalPipeline(StableDiffusionControlNetPipeline, IPAdapterMixin):
                 self.unet,
                 pred_latent,
                 t,
-                encoder_hidden_states=encoder_hidden_states,
+                encoder_hidden_states = encoder_hidden_states,
                 # cross_attention_kwargs=self.cross_attention_kwargs,
                 #dino_down_block_additional_residuals=_dino_down_block_res_samples,
                 return_dict=False,

@@ -163,7 +163,7 @@ def StableNormal(local_cache_dir: Optional[str] = None, device="cuda:0",
 
 
     # 加载预训练权重
-    ckpt_path = "/data/shared/TextureGeneration/Texture/logs/TextureGenera-train-exp86/checkpoints/step=00002000.ckpt"
+    ckpt_path = "/data/shared/TextureGeneration/Texture/logs/TextureGenera-train-exp92/checkpoints/step=00004000.ckpt"
     pipe.load_ip_adapter(ckpt_path)
 
     # state_dict = torch.load(ckpt_path)
