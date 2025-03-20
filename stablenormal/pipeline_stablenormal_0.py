@@ -18,15 +18,12 @@
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-import os
-from safetensors import safe_open
 import numpy as np
 import torch
 from PIL import Image
 from tqdm.auto import tqdm
 from transformers import CLIPImageProcessor, CLIPTextModel, CLIPTokenizer, CLIPVisionModelWithProjection
-from diffusers.loaders import IPAdapterMixin
-from diffusers import DiffusionPipeline, EulerAncestralDiscreteScheduler, DDPMScheduler, UNet2DConditionModel
+
 
 from diffusers.image_processor import PipelineImageInput
 from diffusers.models import (
@@ -51,16 +48,14 @@ from diffusers.utils import USE_PEFT_BACKEND, BaseOutput, deprecate, logging, sc
 
 
 from diffusers.utils.torch_utils import randn_tensor
-from diffusers.pipelines.controlnet import StableDiffusionControlNetPipeline, MultiControlNetModel
+from diffusers.pipelines.controlnet import StableDiffusionControlNetPipeline
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 from diffusers.pipelines.marigold.marigold_image_processing import MarigoldImageProcessor
 from diffusers.pipelines.stable_diffusion.safety_checker import StableDiffusionSafetyChecker
-
-from src.attention_processor import IPAttnProcessor2_0 as IPAttnProcessor, AttnProcessor2_0 as AttnProcessor
-from src.attention_processor import CNAttnProcessor2_0 as CNAttnProcessor
-
-import torch.nn as nn
 import torch.nn.functional as F
+
+import pdb
+
 
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
@@ -106,7 +101,6 @@ class StableNormalOutput(BaseOutput):
     latent: Union[None, torch.Tensor]
     gaus_noise: Union[None, torch.Tensor]
 
-
 from einops import rearrange  
 class DINOv2_Encoder(torch.nn.Module):
     IMAGENET_DEFAULT_MEAN = [0.485, 0.456, 0.406]
@@ -122,6 +116,7 @@ class DINOv2_Encoder(torch.nn.Module):
     ):
         super(DINOv2_Encoder, self).__init__()
         
+        # self.model = torch.hub.load('facebookresearch/dinov2', model_name)
         self.model = torch.hub.load('./dinov2', model_name, source='local')
         self.model.eval().to(device)
         self.device = device
@@ -279,21 +274,10 @@ class StableNormalPipeline(StableDiffusionControlNetPipeline):
         self.prompt_embeds = None
         self.empty_text_embedding = empty_text_embedding
         self.prior = DINOv2_Encoder(size=672)
-        self.clip_image_processor = CLIPImageProcessor()
 
-        self.num_tokens = 4
-        # self.image_encoder.config.projection_dim = 1024
-
-        self.set_ip_adapter()
-        self.image_proj_model = self.init_proj().to(self.device)
-        df_model = DinoFeatureModel().type(torch.float16)
-        self.df_model = df_model.to("cuda:0")
-
-      
     def check_inputs(
         self,
         image: PipelineImageInput,
-        ref_normal: PipelineImageInput,
         num_inference_steps: int,
         ensemble_size: int,
         processing_resolution: int,
@@ -305,8 +289,6 @@ class StableNormalPipeline(StableDiffusionControlNetPipeline):
         generator: Optional[Union[torch.Generator, List[torch.Generator]]],
         output_type: str,
         output_uncertainty: bool,
-        ip_adapter_image=None,
-        ip_adapter_image_embeds=None,
     ) -> int:
         if num_inference_steps is None:
             raise ValueError("`num_inference_steps` is not specified and could not be resolved from the model config.")
@@ -415,22 +397,6 @@ class StableNormalPipeline(StableDiffusionControlNetPipeline):
                     raise ValueError("`generator` device placement is not consistent in the list.")
             elif not isinstance(generator, torch.Generator):
                 raise ValueError(f"Unsupported generator type: {type(generator)}.")
-            
-        # ip-adapter checks
-        if ip_adapter_image is not None and ip_adapter_image_embeds is not None:
-            raise ValueError(
-                "Provide either `ip_adapter_image` or `ip_adapter_image_embeds`. Cannot leave both `ip_adapter_image` and `ip_adapter_image_embeds` defined."
-            )
-
-        if ip_adapter_image_embeds is not None:
-            if not isinstance(ip_adapter_image_embeds, list):
-                raise ValueError(
-                    f"`ip_adapter_image_embeds` has to be of type `list` but is {type(ip_adapter_image_embeds)}"
-                )
-            elif ip_adapter_image_embeds[0].ndim not in [3, 4]:
-                raise ValueError(
-                    f"`ip_adapter_image_embeds` has to be a list of 3D or 4D tensors but is {ip_adapter_image_embeds[0].ndim}D"
-                )
 
         return num_images
 
@@ -452,131 +418,11 @@ class StableNormalPipeline(StableDiffusionControlNetPipeline):
         else:
             raise ValueError("Either `total` or `iterable` has to be defined.")
 
-    def init_proj(self):
-        image_proj_model = ImageProjModel(
-            cross_attention_dim = self.unet.config.cross_attention_dim,
-            clip_embed_dim = 1024,
-            num_tokens = self.num_tokens,
-        ).to(self.device, dtype=torch.float16)
-        return image_proj_model
-
-    def set_ip_adapter(self):
-        unet = self.unet
-        attn_procs = {}
-        for name in unet.attn_processors.keys():
-            cross_attention_dim = None if name.endswith("attn1.processor") else unet.config.cross_attention_dim
-            if name.startswith("mid_block"):
-                hidden_size = unet.config.block_out_channels[-1]
-            elif name.startswith("up_blocks"):
-                block_id = int(name[len("up_blocks.")])
-                hidden_size = list(reversed(unet.config.block_out_channels))[block_id]
-            elif name.startswith("down_blocks"):
-                block_id = int(name[len("down_blocks.")])
-                hidden_size = unet.config.block_out_channels[block_id]
-            if cross_attention_dim is None:
-                attn_procs[name] = AttnProcessor()
-            else:
-                attn_procs[name] = IPAttnProcessor(
-                    hidden_size=hidden_size,
-                    cross_attention_dim=cross_attention_dim,
-                    scale=1.0,
-                    num_tokens=self.num_tokens,
-                ).to(self.device, dtype=torch.float16)
-        unet.set_attn_processor(attn_procs)
-        if hasattr(self, "controlnet"):
-            if isinstance(self.controlnet, MultiControlNetModel):
-                for controlnet in self.controlnet.nets:
-                    controlnet.set_attn_processor(CNAttnProcessor(num_tokens=self.num_tokens))
-            else:
-                self.controlnet.set_attn_processor(CNAttnProcessor(num_tokens=self.num_tokens))
-
-
-    def load_ip_adapter(self, ckpt_path: str):
-        if os.path.splitext(ckpt_path)[-1] == ".safetensors":
-            state_dict = {"image_proj_model": {}, "adapter_modules": {}}
-            with safe_open(ckpt_path, framework="pt", device="cpu") as f:
-                for key in f.keys():
-                    if key.startswith("image_proj_model."):
-                        state_dict["image_proj_model"][key.replace("image_proj_model.", "")] = f.get_tensor(key)
-                    elif key.startswith("adapter_modules."):
-                        state_dict["adapter_modules"][key.replace("adapter_modules.", "")] = f.get_tensor(key)
-        else:
-            state_dict = torch.load(ckpt_path, map_location="cpu")
-        
-        model_weights = state_dict["state_dict"]
-        # print(model_weights.keys())
-        
-        image_proj_weights = {
-            k.replace("image_proj_model.", "", 1): v 
-            for k, v in model_weights.items() 
-            if k.startswith("image_proj_model.")
-        }
-        self.image_proj_model.load_state_dict(image_proj_weights)
-
-        ip_layers = torch.nn.ModuleList(self.unet.attn_processors.values())
-        # attn_processors = self.unet.attn_processors.values()
-        # wrapped_processors = [AttnProcessorWrapper(proc) if not isinstance(proc, torch.nn.Module) else proc for proc in attn_processors]
-        # ip_layers = torch.nn.ModuleList(wrapped_processors)
-        adapter_modules_weights = {
-            k.replace("adapter_modules.", "", 1): v 
-            for k, v in model_weights.items() 
-            if k.startswith("adapter_modules.")
-        }
-        ip_layers.load_state_dict(adapter_modules_weights)
-
-        df_model_weights = {
-            k.replace("df_model.", "", 1): v 
-            for k, v in model_weights.items() 
-            if k.startswith("df_model.")
-        }
-        self.df_model.load_state_dict(df_model_weights)
-
-        print(f"Successfully loaded weights from checkpoint {ckpt_path}")
-
-
-    @torch.inference_mode()
-    def get_image_embeds(self, pil_image=None, clip_image_embeds=None):
-        if pil_image is not None:
-            if isinstance(pil_image, Image.Image):
-                pil_image = [pil_image]
-            clip_image = self.clip_image_processor(images=pil_image, return_tensors="pt").pixel_values
-            # 这里改成使用dino作为image的解码器
-            # clip_image_embeds = self.image_encoder(clip_image.to(self.device, dtype=torch.float16)).image_embeds
-            dino_features_ref = self.prior(clip_image.to(self.device, dtype=torch.float16))
-            dino_features_ref = self.dino_controlnet.dino_controlnet_cond_embedding(dino_features_ref)
-            dino_features_ref = self.df_model(dino_features_ref).to(self.device)
-        else:
-            dino_features_ref = clip_image_embeds.to(self.device, dtype=torch.float16)
-
-
-        self.image_proj_model = self.image_proj_model.to(self.device)
-        image_prompt_embeds = self.image_proj_model(dino_features_ref)
-
-        uncond_image_prompt_embeds = self.image_proj_model(torch.zeros_like(dino_features_ref))
-        return image_prompt_embeds, uncond_image_prompt_embeds
-    
-    
-    '''
-    ip_adapter_image: 
-        输入的图像数据,可以是单个图像或者多个图像组成的列表,每个图像用于一个独立的IP Adapter.
-    ip_adapter_image_embeds: 
-        预先计算好的图像嵌入，如果提供了这个参数，则直接使用这些嵌入，而不从头计算。
-    device: 
-        GPU&CPU
-    num_images_per_prompt: 
-        每个提示(prompt)生成的图像数量。
-    do_classifier_free_guidance: 
-        是否执行分类器自由引导(classifier-free guidance)
-    '''
-
-
-
     @torch.no_grad()
     @replace_example_docstring(EXAMPLE_DOC_STRING)
     def __call__(
         self,
         image: PipelineImageInput,
-        ref_normal: Optional[Image.Image] = None,  # 新增参数
         prompt: Union[str, List[str]] = None,
         negative_prompt: Optional[Union[str, List[str]]] = None,
         num_inference_steps: Optional[int] = None,
@@ -660,7 +506,7 @@ class StableNormalPipeline(StableDiffusionControlNetPipeline):
                 `tuple` is returned where the first element is the prediction, the second element is the uncertainty
                 (or `None`), and the third is the latent (or `None`).
         """
-        
+
         # 0. Resolving variables.
         device = self._execution_device
         dtype = self.dtype
@@ -680,33 +526,14 @@ class StableNormalPipeline(StableDiffusionControlNetPipeline):
             image, latents, generator, ensemble_size, batch_size
         )  # [N,4,h,w], [N,4,h,w]
 
-
+        # 0. X_start latent obtain
         predictor = self.x_start_pipeline(image, latents=gaus_noise, 
-                                    processing_resolution=processing_resolution, skip_preprocess=True)
+                                          processing_resolution=processing_resolution, skip_preprocess=True)
         x_start_latent = predictor.latent
-
-        '''
-        ref_normal的预处理
-        '''
-
-        # ref_normal, padding, original_resolution = self.image_processor.preprocess(
-        #     ref_normal, processing_resolution, resample_method_input, device, dtype
-        # )  # [N,3,PPH,PPW]
-
-        # image_latent_ref, gaus_noise_ref = self.prepare_latents(
-        #     ref_normal, latents, generator, ensemble_size, batch_size
-        # )  # [N,4,h,w], [N,4,h,w]
-
-
-        # predictor_ref = self.x_start_pipeline(image, latents=gaus_noise, 
-        #                             processing_resolution=processing_resolution, skip_preprocess=True)
-        # x_start_latent_ref = predictor_ref.latent
-
 
         # 1. Check inputs.
         num_images = self.check_inputs(
             image,
-            ref_normal,
             num_inference_steps,
             ensemble_size,
             processing_resolution,
@@ -719,6 +546,7 @@ class StableNormalPipeline(StableDiffusionControlNetPipeline):
             output_type,
             output_uncertainty,
         )
+
 
         # 2. Prepare empty text conditioning.
         # Model invocation: self.tokenizer, self.text_encoder.
@@ -733,6 +561,7 @@ class StableNormalPipeline(StableDiffusionControlNetPipeline):
             )
             text_input_ids = text_inputs.input_ids.to(device)
             self.empty_text_embedding = self.text_encoder(text_input_ids)[0]  # [1,2,1024]
+
 
 
         # 3. prepare prompt
@@ -752,50 +581,31 @@ class StableNormalPipeline(StableDiffusionControlNetPipeline):
             self.negative_prompt_embeds = negative_prompt_embeds
 
 
+
         # 5. dino guider features obtaining
         ## TODO different case-1
         dino_features = self.prior(image)
         dino_features = self.dino_controlnet.dino_controlnet_cond_embedding(dino_features)
-        # dino_features = self.match_noisy(dino_features, x_start_latent)
+        dino_features = self.match_noisy(dino_features, x_start_latent)
 
         del (
                 image,
         )
-
-        '''
-        ref_normal的预处理
-        '''
-        num_samples = 4
-
-        image_prompt_embeds, uncond_image_prompt_embeds = self.get_image_embeds(
-            pil_image=ref_normal, clip_image_embeds=None
-        )# 1 4 1024
-
-        # bs_embed, seq_len, _ = image_prompt_embeds.shape
-        # image_prompt_embeds = image_prompt_embeds.repeat(1, num_samples, 1)
-        # image_prompt_embeds = image_prompt_embeds.view(bs_embed * num_samples, seq_len, -1)
-        # uncond_image_prompt_embeds = uncond_image_prompt_embeds.repeat(1, num_samples, 1)
-        # uncond_image_prompt_embeds = uncond_image_prompt_embeds.view(bs_embed * num_samples, seq_len, -1)
-
-        # bs 4 1024 + bs 77 1024 = bs 81 1024
-        encoder_hidden_states = torch.cat([self.prompt_embeds, image_prompt_embeds], dim = 1)
 
         # 7. denoise sampling, using heuritic sampling proposed by Ye.
 
         t_start = self.x_start_pipeline.t_start
         self.scheduler.set_timesteps(num_inference_steps, t_start=t_start,device=device)
 
-        cond_scale = controlnet_conditioning_scale
-        # pred_latent = image_latent
+        cond_scale =controlnet_conditioning_scale
         pred_latent = x_start_latent
-        # 这里直接使用image_latent作为cond_latent, 原版是x_start_latent
-        # 试过image_latent效果不行，还是得x_start_latent
+        # pred_latent = image_latent
 
         cur_step = 0
 
         # dino controlnet
         # dino_down_block_res_samples, dino_mid_block_res_sample = self.dino_controlnet(
-        #     dino_features_ref.detach(),
+        #     dino_features.detach(),
         #     0, # not depend on time steps
         #     encoder_hidden_states=self.prompt_embeds,
         #     conditioning_scale=cond_scale,
@@ -805,7 +615,7 @@ class StableNormalPipeline(StableDiffusionControlNetPipeline):
         # assert dino_mid_block_res_sample == None
 
         pred_latents = []
-        # Denoising loop
+
         last_pred_latent = pred_latent
         for (t, prev_t) in self.progress_bar(zip(self.scheduler.timesteps,self.scheduler.prev_timesteps), leave=False, desc="Diffusion steps..."):
 
@@ -813,7 +623,7 @@ class StableNormalPipeline(StableDiffusionControlNetPipeline):
 
             # # controlnet
             # down_block_res_samples, mid_block_res_sample = self.controlnet(
-            #     image_latent_ref.detach(),
+            #     image_latent.detach(),
             #     t,
             #     encoder_hidden_states=self.prompt_embeds,
             #     conditioning_scale=cond_scale,
@@ -822,22 +632,19 @@ class StableNormalPipeline(StableDiffusionControlNetPipeline):
             # )
 
             # SG-DRN
-            # 在每个时间步t中，模型使用DINO UNet进行去噪操作 
             noise = self.dino_unet_forward(
                 self.unet,
                 pred_latent,
                 t,
-                encoder_hidden_states = encoder_hidden_states,
-                # cross_attention_kwargs=self.cross_attention_kwargs,
+                encoder_hidden_states=self.prompt_embeds,
                 # down_block_additional_residuals=down_block_res_samples,
                 # mid_block_additional_residual=mid_block_res_sample,
                 # dino_down_block_additional_residuals= _dino_down_block_res_samples,
                 return_dict=False,
             )[0]  # [B,4,h,w]
 
-
             pred_latents.append(noise)
-            # ddim steps 利用调度器更新潜在变量
+            # ddim steps
             out = self.scheduler.step(
                 noise, t, prev_t, pred_latent, gaus_noise = gaus_noise, generator=generator, cur_step=cur_step+1  # NOTE that cur_step dirs to next_step
             )# [B,4,h,w]
@@ -953,8 +760,7 @@ class StableNormalPipeline(StableDiffusionControlNetPipeline):
             return F.interpolate(dino, (h, w), mode='bilinear')
 
 
-    
-    
+
 
 
 
@@ -1167,7 +973,7 @@ class StableNormalPipeline(StableDiffusionControlNetPipeline):
                         )
                 else:
                     hidden_states = resnet(hidden_states, temb)
-                    # hidden_states += additional_residuals.pop(0) # %%%%
+                    # hidden_states += additional_residuals.pop(0) %%%
 
 
                 output_states = output_states + (hidden_states,)
@@ -1175,7 +981,7 @@ class StableNormalPipeline(StableDiffusionControlNetPipeline):
             if self.downsamplers is not None:
                 for downsampler in self.downsamplers:
                     hidden_states = downsampler(hidden_states)
-                    # hidden_states += additional_residuals.pop(0) # %%%%
+                    # hidden_states += additional_residuals.pop(0) %%%
 
                 output_states = output_states + (hidden_states,)
 
@@ -1240,14 +1046,14 @@ class StableNormalPipeline(StableDiffusionControlNetPipeline):
                         return_dict=False,
                     )[0]
 
-                # hidden_states += additional_residuals.pop(0) # %%%%
+                # hidden_states += additional_residuals.pop(0) %%%%
 
                 output_states = output_states + (hidden_states,)
 
             if self.downsamplers is not None:
                 for downsampler in self.downsamplers:
                     hidden_states = downsampler(hidden_states)
-                    # hidden_states += additional_residuals.pop(0) # %%%%
+                    # hidden_states += additional_residuals.pop(0) %%%%
 
                 output_states = output_states + (hidden_states,)
 
@@ -1256,7 +1062,7 @@ class StableNormalPipeline(StableDiffusionControlNetPipeline):
 
         down_intrablock_additional_residuals = dino_down_block_additional_residuals
 
-        # sample += down_intrablock_additional_residuals.pop(0) # %%%%
+        # sample += down_intrablock_additional_residuals.pop(0) %%%%
         down_block_res_samples = (sample,)
 
         for downsample_block in self.down_blocks:
@@ -1415,7 +1221,6 @@ class StableNormalPipeline(StableDiffusionControlNetPipeline):
 
         return closest_normals, uncertainty  # [1,3,H,W], [1,1,H,W]
 
-
 # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.retrieve_timesteps
 def retrieve_timesteps(
     scheduler,
@@ -1474,78 +1279,3 @@ def retrieve_timesteps(
         scheduler.set_timesteps(num_inference_steps, device=device, **kwargs)
         timesteps = scheduler.timesteps
     return timesteps, num_inference_steps
-
-
-class DinoFeatureModel(torch.nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.global_pool = nn.AdaptiveAvgPool2d((1, 1))  # 全局平均池化
-        self.fc = nn.Linear(320, 1024)                   # 线性映射
-
-    def forward(self, x):
-        x = self.global_pool(x)  # [batch, 1024, 1, 1]
-        x = x.flatten(1)         # [batch, 1024]
-        x = self.fc(x)            # [batch, 1024]
-        return x
-
-# 图像投影模型：将CLIP图像特征映射为提示词序列
-class ImageProjModel(torch.nn.Module):
-    def __init__(self, clip_embed_dim=1024, cross_attention_dim=1024, num_tokens=4):
-        super().__init__()
-        self.cross_attention_dim = cross_attention_dim
-        self.num_tokens = num_tokens
-
-        self.generator = None
-
-        self.proj = torch.nn.Linear(clip_embed_dim, self.num_tokens * cross_attention_dim)
-        self.norm = torch.nn.LayerNorm(cross_attention_dim)
-
-        
-    def forward(self, image_embeds):
-        # image_embeds: [B, clip_embed_dim]
-
-        assert not torch.isnan(image_embeds).any(), "输入包含NaN"
-
-        
-        embeds = image_embeds
-        clip_extra_context_tokens = self.proj(embeds)
-        clip_extra_context_tokens = clip_extra_context_tokens.reshape(
-            -1, self.num_tokens, self.cross_attention_dim
-        )
-        clip_extra_context_tokens = self.norm(clip_extra_context_tokens)
-    
-        return clip_extra_context_tokens
-    
-class AdapterModule(torch.nn.Module):
-    def __init__(self, unet, adapter_dim=64):
-        super().__init__()
-        # 为UNet的每个交叉注意力层添加适配层
-        self.adapters = torch.nn.ModuleList()
-        
-        for block in unet.down_blocks + unet.up_blocks:
-            if hasattr(block, "attentions"):
-                for attn in block.attentions:
-                    for transformer_block in attn.transformer_blocks:
-
-                        # 注入适配层到交叉注意力模块
-                        adapter = torch.nn.Sequential(
-                            torch.nn.LayerNorm(adapter_dim),
-                            torch.nn.Linear(transformer_block.attn2.to_k.in_features, adapter_dim),
-                            torch.nn.ReLU(),
-                            torch.nn.Linear(adapter_dim, transformer_block.attn2.to_k.in_features)
-                        )
-                        self.adapters.append(adapter)
-                        # 冻结原始权重，只训练适配器
-                        for param in transformer_block.attn2.parameters():
-                            param.requires_grad = False
-                        
-
-
-class AttnProcessorWrapper(torch.nn.Module):
-    def __init__(self, processor):
-        super().__init__()
-        self.processor = processor
-
-    def forward(self, *args, **kwargs):
-        return self.processor(*args, **kwargs)
-

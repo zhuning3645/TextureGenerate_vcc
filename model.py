@@ -10,9 +10,9 @@ from PIL import Image, ImageOps
 from torch.nn.functional import interpolate
 import torch.nn.functional as F
 from diffusers import ControlNetModel, AutoencoderKL, UniPCMultistepScheduler, DDPMScheduler
-from diffusers.models.attention_processor import IPAdapterAttnProcessor2_0 as IPAttnProcessor, AttnProcessor2_0 as AttnProcessor
+# from diffusers.models.attention_processor import IPAdapterAttnProcessor2_0 as IPAttnProcessor, AttnProcessor2_0 as AttnProcessor
 import torch.nn as nn
-from transformers import CLIPImageProcessor, CLIPTextModel, CLIPTokenizer
+
 dependencies = ["torch", "numpy", "diffusers", "PIL"]
 
 from stablenormal.pipeline_yoso_normal import YOSONormalsPipeline
@@ -22,8 +22,7 @@ import warnings
 import math
 from itertools import chain
 import logging
-from pipe import RefOnlyNoisedUNet
-
+from src.attention_processor import IPAttnProcessor2_0 as IPAttnProcessor, AttnProcessor2_0 as AttnProcessor
 
 
 def batch_pad_to_square(images: torch.Tensor) -> Tuple[torch.Tensor, Tuple[int, int]]:
@@ -72,7 +71,7 @@ def unscale_latents(latents):
     return latents
 
 def unscale_image(image):
-    image = image / 0.5 * 0.8
+    image = image / 0.5 * 0.3
     return image
 
 def extract_into_tensor(a, t, x_shape):
@@ -155,6 +154,44 @@ class AttnProcessorWrapper(torch.nn.Module):
     def forward(self, *args, **kwargs):
         return self.processor(*args, **kwargs)
 
+class IPAdapter(torch.nn.Module):
+    """IP-Adapter"""
+    def __init__(self, unet, image_proj_model, adapter_modules, ckpt_path=None):
+        super().__init__()
+        self.unet = unet
+        self.image_proj_model = image_proj_model
+        self.adapter_modules = adapter_modules
+
+        if ckpt_path is not None:
+            self.load_from_checkpoint(ckpt_path)
+
+    # def forward(self, noisy_latents, timesteps, encoder_hidden_states, image_embeds):
+    #     ip_tokens = self.image_proj_model(image_embeds)
+    #     encoder_hidden_states = torch.cat([encoder_hidden_states, ip_tokens], dim=1)
+    #     # Predict the noise residual
+    #     noise_pred = self.unet(noisy_latents, timesteps, encoder_hidden_states).sample
+    #     return noise_pred
+
+    def load_from_checkpoint(self, ckpt_path: str):
+        # Calculate original checksums
+        orig_ip_proj_sum = torch.sum(torch.stack([torch.sum(p) for p in self.image_proj_model.parameters()]))
+        orig_adapter_sum = torch.sum(torch.stack([torch.sum(p) for p in self.adapter_modules.parameters()]))
+
+        state_dict = torch.load(ckpt_path, map_location="cpu")
+
+        # Load state dict for image_proj_model and adapter_modules
+        self.image_proj_model.load_state_dict(state_dict["image_proj"], strict=True)
+        self.adapter_modules.load_state_dict(state_dict["ip_adapter"], strict=True)
+
+        # Calculate new checksums
+        new_ip_proj_sum = torch.sum(torch.stack([torch.sum(p) for p in self.image_proj_model.parameters()]))
+        new_adapter_sum = torch.sum(torch.stack([torch.sum(p) for p in self.adapter_modules.parameters()]))
+
+        # Verify if the weights have changed
+        assert orig_ip_proj_sum != new_ip_proj_sum, "Weights of image_proj_model did not change!"
+        assert orig_adapter_sum != new_adapter_sum, "Weights of adapter_modules did not change!"
+
+        print(f"Successfully loaded weights from checkpoint {ckpt_path}")
 
 # 创建 LightningModule 作为封装器
 class WrapperLightningModule(pl.LightningModule):
@@ -165,7 +202,7 @@ class WrapperLightningModule(pl.LightningModule):
         device="cuda:0", 
         yoso_version='yoso-normal-v0-3', 
         diffusion_version='stable-normal-v0-1',
-        drop_cond_prob = 0.1,
+        drop_cond_prob = 0.05,
         prompt="The normal map",
 
         
@@ -278,37 +315,45 @@ class WrapperLightningModule(pl.LightningModule):
             if cross_attention_dim is None:
                 attn_procs[name] = AttnProcessor()
             else:
+                # layer_name = name.split(".processor")[0]
+                # weights = {
+                #     "to_k_ip.0.weight": unet_sd.get(layer_name + ".to_k.0.weight", unet_sd[layer_name + ".to_k.weight"]),
+                #     "to_v_ip.0.weight": unet_sd.get(layer_name + ".to_v.0.weight", unet_sd[layer_name + ".to_v.weight"]),
+                # }
+                # attn_procs[name] = IPAttnProcessor(hidden_size=hidden_size, cross_attention_dim=cross_attention_dim)
+                # ip_processor = IPAttnProcessor(
+                #         hidden_size=hidden_size,
+                #         cross_attention_dim=cross_attention_dim,
+                #         num_tokens=[4],  # 兼容 num_tokens=4
+                #         scale=[1.0]      # 兼容 scale=1.0
+                #     )
+                # # 加载权重
+                # ip_processor.to_k_ip[0].weight = torch.nn.Parameter(weights["to_k_ip.0.weight"])
+                # ip_processor.to_v_ip[0].weight = torch.nn.Parameter(weights["to_v_ip.0.weight"])
+                # attn_procs[name] = ip_processor
                 layer_name = name.split(".processor")[0]
                 weights = {
-                    "to_k_ip.0.weight": unet_sd.get(layer_name + ".to_k.0.weight", unet_sd[layer_name + ".to_k.weight"]),
-                    "to_v_ip.0.weight": unet_sd.get(layer_name + ".to_v.0.weight", unet_sd[layer_name + ".to_v.weight"]),
+                    "to_k_ip.weight": unet_sd[layer_name + ".to_k.weight"],
+                    "to_v_ip.weight": unet_sd[layer_name + ".to_v.weight"],
                 }
                 attn_procs[name] = IPAttnProcessor(hidden_size=hidden_size, cross_attention_dim=cross_attention_dim)
-                ip_processor = IPAttnProcessor(
-                        hidden_size=hidden_size,
-                        cross_attention_dim=cross_attention_dim,
-                        num_tokens=[4],  # 兼容 num_tokens=4
-                        scale=[1.0]      # 兼容 scale=1.0
-                    )
-                # 加载权重
-                ip_processor.to_k_ip[0].weight = torch.nn.Parameter(weights["to_k_ip.0.weight"])
-                ip_processor.to_v_ip[0].weight = torch.nn.Parameter(weights["to_v_ip.0.weight"])
-                attn_procs[name] = ip_processor
+                attn_procs[name].load_state_dict(weights)
         
         self.pipe.unet.set_attn_processor(attn_procs)
+        adapter_modules = torch.nn.ModuleList(self.pipe.unet.attn_processors.values()).to(device)
 
-        # adapter_modules = torch.nn.ModuleList(self.pipe.unet.attn_processors.values()).to(device)
-        attn_processors = self.pipe.unet.attn_processors.values()
-        wrapped_processors = [AttnProcessorWrapper(proc) if not isinstance(proc, torch.nn.Module) else proc for proc in attn_processors]
-        adapter_modules = torch.nn.ModuleList(wrapped_processors).to(device)
+        # attn_processors = self.pipe.unet.attn_processors.values()
+        # wrapped_processors = [AttnProcessorWrapper(proc) if not isinstance(proc, torch.nn.Module) else proc for proc in attn_processors]
+        # adapter_modules = torch.nn.ModuleList(wrapped_processors).to(device)
         
+        ip_adapter = IPAdapter(self.pipe.unet, image_proj_model, adapter_modules, None)
 
         # 步骤2: 创建IPAdapter实例
-        self.image_proj_model=image_proj_model
-        self.adapter_modules=adapter_modules
+        self.image_proj_model=ip_adapter.image_proj_model
+        self.adapter_modules=ip_adapter.adapter_modules
 
-        self.pipe.image_proj_model=self.image_proj_model
-        self.pipe.adapter_modules=self.adapter_modules
+        # self.pipe.image_proj_model=self.image_proj_model
+        # self.pipe.adapter_modules=self.adapter_modules
 
         self.image_proj_model.requires_grad_(True)
         self.adapter_modules.requires_grad_(True)
@@ -467,7 +512,14 @@ class WrapperLightningModule(pl.LightningModule):
                 cond_latents, gaus_noise = self.pipe.prepare_latents(
                     image, latents, generator, ensemble_size = 1, batch_size = 1
                 )# [N,4,h,w], [N,4,h,w]
-            
+
+            # 使用前一个生成的latents作为主pipe的cond_latents，但是loss降不下去，并且训练花费的时间长，废弃
+            # global_pool_2 = nn.AdaptiveAvgPool2d((1, 1)) 
+            # gaus_noise = global_pool_2(gaus_noise)
+
+            # predictor = self.x_start_pipeline(image, latents=gaus_noise, 
+            #                         processing_resolution=8, skip_preprocess=True)
+            # cond_latents = predictor.latent
 
             #生成latenst_noisy的作为预测过程的起始量  
             latents_gt, gaus_noise_gt = self.pipe.prepare_latents(
@@ -478,7 +530,8 @@ class WrapperLightningModule(pl.LightningModule):
             #对ref_normal使用dino encoder 生成features
             ref_normal = ref_normal.to(dtype=next(self.pipe.prior.parameters()).dtype)
             dino_features_ref = self.pipe.prior(ref_normal)
-            dino_features_ref = dino_features_ref.type(torch.float16)
+            dino_features_ref = dino_features_ref.type(torch.float16) # bs 1024 48 48 
+ 
             dino_features_ref = self.pipe.dino_controlnet.dino_controlnet_cond_embedding(dino_features_ref)
             # bs 320 96 96
             # 对dino encoder features应用线性层
@@ -502,21 +555,9 @@ class WrapperLightningModule(pl.LightningModule):
             loss, loss_dict = self.compute_loss(prev_noise, v_target)
 
             # 日志记录
-            self.log_dict(
-                loss_dict,
-                prog_bar=True,
-                logger=True,
-                on_step=True,
-                on_epoch=True
-            )
+            self.log_dict(loss_dict, prog_bar=True, logger=True, on_step=True, on_epoch=True)
             
-            self.log('train_loss',
-                loss,
-                on_step=True, 
-                on_epoch=True,
-                prog_bar=True,
-                logger=True
-            )
+            self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
 
             lr = self.optimizers().param_groups[0]['lr']
             self.log('lr_abs', lr, prog_bar=True, logger=True, on_step=True, on_epoch=False)
@@ -528,10 +569,10 @@ class WrapperLightningModule(pl.LightningModule):
         return loss
 
     
-    def forward(self, latents_noisy, cond_latents, t , encoder_hidden_states):
+    def forward(self, latents_noisy, cond_latents, t, encoder_hidden_states):
         """优化的前向传播"""
         #给定起始条件 coarse normal的潜在变量
-        cross_attention_kwargs = dict(cond_lat=cond_latents)
+        cross_attention_kwargs = dict(cond_lat = cond_latents)
 
         pred_latent = latents_noisy
 
@@ -613,7 +654,7 @@ class WrapperLightningModule(pl.LightningModule):
         # 确保 latents 是 float16
         latents = latents.to(torch.float16)
 
-        prediction = self.pipe.decode_prediction(latents)
+        prediction = unscale_image(self.pipe.decode_prediction(latents))
         images = (prediction.clip(-1, 1) + 1) / 2
 
         # images = unscale_image(self.pipe.vae.decode(latents / self.pipe.vae.config.scaling_factor, return_dict=False)[0])   # [-1, 1]
@@ -624,8 +665,6 @@ class WrapperLightningModule(pl.LightningModule):
         images = torch.cat([group1, group2], dim=-2)
 
         grid = make_grid(images, nrow=images.shape[0], normalize=True, value_range=(0, 1))
-
-        # save_image(grid, os.path.join(self.logdir, 'images', f'train_{self.global_step:07d}.png'))
 
         save_path = os.path.join(self.logdir, 'images', f"*train_step_{self.global_step:07d}.png")
         save_dir = os.path.join(self.logdir, 'images')

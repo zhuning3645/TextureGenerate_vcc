@@ -1,14 +1,11 @@
 import os
-os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 from typing import Optional, Tuple
 import torch
 import numpy as np
 from torchvision import transforms
 from PIL import Image, ImageOps
 from torch.nn.functional import interpolate
-from diffusers import ControlNetModel, AutoencoderKL, UniPCMultistepScheduler
-from diffusers.models.attention_processor import IPAdapterAttnProcessor2_0
-import torch.nn as nn
+
 
 dependencies = ["torch", "numpy", "diffusers", "PIL"]
 
@@ -99,7 +96,6 @@ class Predictor:
         
 
         # 在这里结束编辑
-
         if mode == 'stable':
             init_latents = torch.zeros([1, 4, image_resolution // 8, image_resolution // 8], 
                                     device="cuda", dtype=torch.float16)
@@ -109,21 +105,11 @@ class Predictor:
         print(f"Current model: {self.model.__class__.__name__}")
 
         
-        pipe_out = self.model(
-                            img,
-                            ref_normal, 
-                            match_input_resolution=True, 
-                            latents=init_latents,
-                        )
-
-        # print('pipe_out',pipe_out)
-        # 归一化到[0,1]
+        pipe_out = self.model(img, ref_normal, match_input_resolution=True, latents=init_latents)
         pred_normal = (pipe_out.prediction.clip(-1, 1) + 1) / 2
-        # 转化为unit8
         pred_normal = (pred_normal[0] * 255).astype(np.uint8)
-        # 转换为PIL图像
         pred_normal = Image.fromarray(pred_normal)
-        
+
         new_dims = (int(original_dims[1]), int(original_dims[0])) # reverse the shape (width, height)
         pred_normal = pred_normal.resize(new_dims, Image.Resampling.LANCZOS)
 
@@ -163,7 +149,7 @@ def StableNormal(local_cache_dir: Optional[str] = None, device="cuda:0",
 
 
     # 加载预训练权重
-    ckpt_path = "/data/shared/TextureGeneration/Texture/logs/TextureGenera-train-exp92/checkpoints/step=00004000.ckpt"
+    ckpt_path = "/data/shared/TextureGeneration/Texture/logs/TextureGenera-train-exp101/checkpoints/last.ckpt"
     pipe.load_ip_adapter(ckpt_path)
 
     # state_dict = torch.load(ckpt_path)
@@ -223,7 +209,6 @@ def _test_run():
         with torch.inference_mode():
             normal_image = predictor(image) 
 
-    
     normal_image.save(args.output)
 
 if __name__ == "__main__":
