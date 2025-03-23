@@ -66,12 +66,20 @@ def center_crop(image: torch.Tensor) -> Tuple[torch.Tensor, Tuple[int, int], Tup
     cropped = image[:, top:top+crop_size, left:left+crop_size]
     return cropped, (h, w), (left, top, left+crop_size, top+crop_size)
 
+def scale_latents(latents):
+    latents = (latents - 0.22) * 0.75
+    return latents
+
 def unscale_latents(latents):
     latents = latents / 0.75 + 0.22
     return latents
 
+def scale_image(image):
+    image = image * 0.5 / 0.8
+    return image
+
 def unscale_image(image):
-    image = image / 0.5 * 0.3
+    image = image / 0.5 * 0.8
     return image
 
 def extract_into_tensor(a, t, x_shape):
@@ -79,49 +87,39 @@ def extract_into_tensor(a, t, x_shape):
     out = a.gather(-1, t)
     return out.reshape(b, *((1,) * (len(x_shape) - 1)))
 
-def scale_latents(latents):
-    latents = (latents - 0.22) * 0.75
-    return latents
-
-class DinoFeatureModel(torch.nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.global_pool = nn.AdaptiveAvgPool2d((1, 1))  # 全局平均池化
-        self.fc = nn.Linear(320, 1024)                   # 线性映射
-
-    def forward(self, x):
-        x = self.global_pool(x)  # [batch, 320, 1, 1]
-        x = x.flatten(1)         # [batch, 320]
-        x = self.fc(x)            # [batch, 1024]
-        return x
-
 # 图像投影模型：将CLIP图像特征映射为提示词序列
+# 输入形状[bs clip_embed_dim] 输出形状 [bs, num_tokens, cross_attention_dim]
 class ImageProjModel(torch.nn.Module):
-    def __init__(self, clip_embed_dim=1024, cross_attention_dim=1024, num_tokens=4):
+    def __init__(self, clip_embed_dim=1024, cross_attention_dim=1024, num_tokens=1024):
         super().__init__()
         self.cross_attention_dim = cross_attention_dim
         self.num_tokens = num_tokens
 
         self.generator = None
 
-        self.proj = torch.nn.Linear(clip_embed_dim, self.num_tokens * cross_attention_dim)
+        self.proj = torch.nn.Linear(clip_embed_dim, cross_attention_dim)
         self.norm = torch.nn.LayerNorm(cross_attention_dim)
-
-        
-    def forward(self, image_embeds):
+ 
+    def forward(self, x):
         # image_embeds: [B, clip_embed_dim]
+        assert not torch.isnan(x).any(), "输入包含NaN"
 
-        assert not torch.isnan(image_embeds).any(), "输入包含NaN"
+        b, c, h, w = x.shape
 
-        
-        embeds = image_embeds
-        clip_extra_context_tokens = self.proj(embeds)
-        clip_extra_context_tokens = clip_extra_context_tokens.reshape(
-            -1, self.num_tokens, self.cross_attention_dim
-        )
-        clip_extra_context_tokens = self.norm(clip_extra_context_tokens)
-    
-        return clip_extra_context_tokens
+        # 1. 展平空间维度: [b, 1024, 2304]
+        x = x.reshape(b, c, h * w)
+
+        # 2. 交换维度和合并Batch: [b*2304, 1024]
+        x = x.permute(0, 2, 1)  # [b, 2304, 1024]
+        x = x.reshape(-1, c)    # [b*2304, 1024]
+
+        # 3. 线性映射: [b*2304, cross_attention_dim]
+        x = self.proj(x)
+        x = x.reshape(b, h * w, -1)  # [b, 2304, cross_attention_dim]
+
+        # 5. 归一化
+        x = self.norm(x)
+        return x
     
 class AdapterModule(torch.nn.Module):
     def __init__(self, unet, adapter_dim=64):
@@ -146,13 +144,6 @@ class AdapterModule(torch.nn.Module):
                         for param in transformer_block.attn2.parameters():
                             param.requires_grad = False
                         
-class AttnProcessorWrapper(torch.nn.Module):
-    def __init__(self, processor):
-        super().__init__()
-        self.processor = processor
-
-    def forward(self, *args, **kwargs):
-        return self.processor(*args, **kwargs)
 
 class IPAdapter(torch.nn.Module):
     """IP-Adapter"""
@@ -225,6 +216,7 @@ class WrapperLightningModule(pl.LightningModule):
         torch.autograd.set_detect_anomaly(True)
         # 添加内存优化配置
         self.batch_format_ready = False
+        self.best_loss = float('inf')
         
         # 缓存预处理结果
         self.preprocessed_cache = {}
@@ -258,6 +250,47 @@ class WrapperLightningModule(pl.LightningModule):
             low_cpu_mem_usage=False,
             ignore_mismatched_sizes=True
         )
+        original_conv_in = self.pipe.unet.conv_in
+        self.conv_in = nn.Conv2d(8, 320, kernel_size=3, padding=1)
+
+        # 创建新的 conv_in 层（输入通道改为 8，其他参数不变）
+        new_conv_in = nn.Conv2d(
+            in_channels=8,  # 修改输入通道为 8
+            out_channels=original_conv_in.out_channels,
+            kernel_size=original_conv_in.kernel_size,
+            stride=original_conv_in.stride,
+            padding=original_conv_in.padding,
+            dilation=original_conv_in.dilation,
+            groups=original_conv_in.groups,
+            bias=original_conv_in.bias is not None,
+            padding_mode=original_conv_in.padding_mode
+        )
+
+        # 权重复制逻辑（核心修改部分）
+        with torch.no_grad():
+            # 获取原始权重 [out_channels=320, in_channels=4, kH, kW]
+            original_weight = original_conv_in.weight
+            
+            # 沿输入通道维度复制原始权重（扩展为8通道）
+            # 这里将前4通道复制到后4通道
+            duplicated_weight = torch.cat([
+                original_weight, 
+                original_weight   # 复制并减弱新通道权重
+            ], dim=1)  # 沿输入通道维度拼接
+            
+            # 调整权重形状以匹配新卷积层 [320, 8, 3, 3]
+            new_conv_in.weight[:] = duplicated_weight
+            
+            # 复制偏置（若有）
+            if new_conv_in.bias is not None:
+                new_conv_in.bias.data = original_conv_in.bias.data.clone()
+
+
+        # 替换 UNet 的 conv_in 层
+        self.pipe.unet.conv_in = new_conv_in
+
+        print(self.pipe.unet.conv_in.weight.shape)  # 应输出 torch.Size([320, 8, 3, 3])
+        print(self.pipe.unet.conv_in.weight.dtype)  # 应输出 torch.float16
 
         train_sched = DDPMScheduler.from_config(self.pipe.scheduler.config)
         # if isinstance(self.pipe.unet, UNet2DConditionModel):
@@ -352,11 +385,9 @@ class WrapperLightningModule(pl.LightningModule):
         self.image_proj_model=ip_adapter.image_proj_model
         self.adapter_modules=ip_adapter.adapter_modules
 
-        # self.pipe.image_proj_model=self.image_proj_model
-        # self.pipe.adapter_modules=self.adapter_modules
-
         self.image_proj_model.requires_grad_(True)
         self.adapter_modules.requires_grad_(True)
+        self.conv_in.requires_grad_(True)
             
         # 日志目录
         self.log_dir = "training_logs"
@@ -378,9 +409,6 @@ class WrapperLightningModule(pl.LightningModule):
                 )
                 self.prompt_embeds = prompt_embeds
         
-        df_model = DinoFeatureModel().type(torch.float16)
-        self.df_model = df_model.to(device)
-        # self.df_model = self.pipe.df_model
 
         # 验证可训练参数数量
         trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
@@ -390,7 +418,7 @@ class WrapperLightningModule(pl.LightningModule):
 
 
     
-    def _preprocess_image(self, images: Union[List[Image.Image], torch.Tensor]) -> torch.Tensor:
+    def _preprocess_image(self, size: int, images: Union[List[Image.Image], torch.Tensor]) -> torch.Tensor:
         """批量预处理管道（兼容PIL和Tensor输入）"""
         # 输入格式验证
         if isinstance(images, list):
@@ -418,7 +446,7 @@ class WrapperLightningModule(pl.LightningModule):
             # 带反锯齿的调整大小
             resized = F.interpolate(
                 padded,
-                size=(768, 768),
+                size=(size, size),
                 mode='bicubic',
                 align_corners=False,
                 antialias=True
@@ -450,17 +478,18 @@ class WrapperLightningModule(pl.LightningModule):
         processed = {}
         
 
-        # 图像预处理
-        images = torch.stack([
-            self._preprocess_image(img) for img in batch['input_images']
-        ]).to(self.device)
+        images = self._preprocess_image(
+            size=768, 
+            images=batch['input_images']  # 直接传入整个图像列表
+        ).to(self.device)
         
-        
+        size_crop = 512
         # 参考法线图
         if 'ref_normals' in batch and batch['ref_normals'] is not None:
-            ref_normal = torch.stack([
-                self._preprocess_image(img) for img in batch['ref_normals']
-            ]).to(self.device)
+            ref_normal = self._preprocess_image(
+                size=size_crop,
+                images=batch['ref_normals']  # 直接传递整个batch
+            ).to(self.device)
         else:
             ref_normal = None
 
@@ -502,57 +531,57 @@ class WrapperLightningModule(pl.LightningModule):
             B = image.shape[0]
             t = torch.randint(0, self.num_timesteps, size=(B,)).long().to(self.device)
 
+            '''
+            encode_condition_image使用采样，生成带随机性latents，用于训练，增强鲁棒性
+            prepare_latents使用均值，适合用于推理阶段，能生成确定性的latents
+            '''
+
             latents, generator = None, None
+
             # classifier-free guidance
             if np.random.rand() < self.drop_cond_prob:
-                cond_latents, gaus_noise = self.pipe.prepare_latents(
-                    torch.zeros_like(image), latents, generator,  ensemble_size = 1, batch_size = 1
-                )# [1, 4, 96, 96]
+                cond_latents = self.encode_condition_image(torch.zeros_like(image))# [1, 4, 96, 96]
             else:
-                cond_latents, gaus_noise = self.pipe.prepare_latents(
-                    image, latents, generator, ensemble_size = 1, batch_size = 1
-                )# [N,4,h,w], [N,4,h,w]
+                cond_latents = self.encode_condition_image(image)
 
-            # 使用前一个生成的latents作为主pipe的cond_latents，但是loss降不下去，并且训练花费的时间长，废弃
-            # global_pool_2 = nn.AdaptiveAvgPool2d((1, 1)) 
-            # gaus_noise = global_pool_2(gaus_noise)
 
-            # predictor = self.x_start_pipeline(image, latents=gaus_noise, 
-            #                         processing_resolution=8, skip_preprocess=True)
-            # cond_latents = predictor.latent
-
-            #生成latenst_noisy的作为预测过程的起始量  
-            latents_gt, gaus_noise_gt = self.pipe.prepare_latents(
-                render_gt, latents, generator, ensemble_size = 1, batch_size = 1)
+            latents_gt = self.encode_target_images(render_gt)
             noise = torch.randn_like(latents_gt)
             latents_noisy = self.train_scheduler.add_noise(latents_gt, noise, t)
-        
+            
             #对ref_normal使用dino encoder 生成features
-            ref_normal = ref_normal.to(dtype=next(self.pipe.prior.parameters()).dtype)
+            ref_normal = ref_normal.to(dtype=next(self.pipe.prior.parameters()).dtype) # bs 3 512 512
+            # print(f"ref_normal:{ref_normal.shape}")
             dino_features_ref = self.pipe.prior(ref_normal)
-            dino_features_ref = dino_features_ref.type(torch.float16) # bs 1024 48 48 
- 
-            dino_features_ref = self.pipe.dino_controlnet.dino_controlnet_cond_embedding(dino_features_ref)
-            # bs 320 96 96
-            # 对dino encoder features应用线性层
-            dino_features_ref = self.df_model(dino_features_ref) # bs 1024 
 
-            v_target = self.get_v(latents_gt, noise, t).half()
+            dino_features_ref = dino_features_ref.type(torch.float16) # bs 1024 48 48 
+            # print(f"dino_features_ref:{dino_features_ref.shape}")
 
             #使用dino encoder的特征生成tokens
-            ip_tokens = self.image_proj_model(dino_features_ref) # bs 4 1024
+            ip_tokens = self.image_proj_model(dino_features_ref) # bs 48*48 1024
+            # print(f"ip_tokens:{ip_tokens.shape}")
             ip_tokens = ip_tokens.half()
             batch_size = ip_tokens.size(0)
             # 根据bs扩展文本嵌入的维度
             self.prompt_embeds = self.prompt_embeds.expand(batch_size, -1, -1) # bs 77 1024
-            encoder_hidden_states = torch.cat([self.prompt_embeds, ip_tokens], dim=1) # bs 81 1024
+            encoder_hidden_states = torch.cat([self.prompt_embeds, ip_tokens], dim=1) # bs 77 1024 + bs 2304 1024
 
             # 内存优化：释放不需要的缓存
             torch.cuda.empty_cache()
+
+            v_target = self.get_v(latents_gt, noise, t).half()
             
             # 使用梯度累积 
             prev_noise = self.forward(latents_noisy, cond_latents, t, encoder_hidden_states)
             loss, loss_dict = self.compute_loss(prev_noise, v_target)
+
+            # 新增代码：记录最小loss值
+            current_loss = loss.item()  # 将loss转为Python数值
+            if current_loss < self.best_loss:
+                old_best_loss = self.best_loss  
+                self.best_loss = current_loss
+                print(f"🙏🙏🙏 oh!!! New minimum loss achieved: {old_best_loss:.4f} --> {self.best_loss:.4f}")
+                print(f"(↓{old_best_loss - self.best_loss:.4f})")
 
             # 日志记录
             self.log_dict(loss_dict, prog_bar=True, logger=True, on_step=True, on_epoch=True)
@@ -571,40 +600,17 @@ class WrapperLightningModule(pl.LightningModule):
     
     def forward(self, latents_noisy, cond_latents, t, encoder_hidden_states):
         """优化的前向传播"""
-        #给定起始条件 coarse normal的潜在变量
-        cross_attention_kwargs = dict(cond_lat = cond_latents)
 
-        pred_latent = latents_noisy
-
-        # down_block_res_samples, mid_block_res_sample = self.pipe.controlnet(
-        #         cond_latents,
-        #         t,
-        #         encoder_hidden_states=encoder_hidden_states,
-        #         conditioning_scale=1.0,
-        #         guess_mode=False,
-        #         return_dict=False,
-        #     )
+        latent = torch.cat([latents_noisy, cond_latents], dim=1)
+        # print(f"latent:{latent.shape}")
 
         prev_noise = self.pipe.dino_unet_forward(
             self.pipe.unet,
-            pred_latent,
+            latent,
             t,
             encoder_hidden_states = encoder_hidden_states,
-            # down_block_additional_residuals = down_block_res_samples,
-            # mid_block_additional_residual = mid_block_res_sample,
-            cross_attention_kwargs = cross_attention_kwargs,
             return_dict = False,
         )[0]
-
-        # prev_noise = self.pipe.unet(
-        #     pred_latent,
-        #     t,
-        #     encoder_hidden_states = encoder_hidden_states,
-        #     # down_block_additional_residuals = down_block_res_samples,
-        #     # mid_block_additional_residual = mid_block_res_sample,
-        #     cross_attention_kwargs = cross_attention_kwargs,
-        #     return_dict = False,
-        # )[0]
 
         return prev_noise
 
@@ -659,7 +665,7 @@ class WrapperLightningModule(pl.LightningModule):
 
         # images = unscale_image(self.pipe.vae.decode(latents / self.pipe.vae.config.scaling_factor, return_dict=False)[0])   # [-1, 1]
         # images = (images * 0.5 + 0.5).clamp(0, 1)
-        
+        ref_image = F.interpolate(ref_image, size=(768, 768), mode='bilinear')
         group1 = torch.cat([ref_image, input_image], dim=-1) 
         group2 = torch.cat([render_gt, images], dim=-1)
         images = torch.cat([group1, group2], dim=-2)
@@ -721,7 +727,6 @@ class WrapperLightningModule(pl.LightningModule):
             params=chain(
                 self.image_proj_model.parameters(),
                 self.adapter_modules.parameters(),
-                # self.unet.parameters(),
                 ),
             lr=base_lr,
             weight_decay=1e-2,

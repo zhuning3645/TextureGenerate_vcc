@@ -286,8 +286,6 @@ class StableNormalPipeline(StableDiffusionControlNetPipeline):
 
         self.set_ip_adapter()
         self.image_proj_model = self.init_proj().to(self.device)
-        df_model = DinoFeatureModel().type(torch.float16)
-        self.df_model = df_model.to("cuda:0")
 
       
     def check_inputs(
@@ -524,13 +522,6 @@ class StableNormalPipeline(StableDiffusionControlNetPipeline):
         }
         ip_layers.load_state_dict(adapter_modules_weights)
 
-        df_model_weights = {
-            k.replace("df_model.", "", 1): v 
-            for k, v in model_weights.items() 
-            if k.startswith("df_model.")
-        }
-        self.df_model.load_state_dict(df_model_weights)
-
         print(f"Successfully loaded weights from checkpoint {ckpt_path}")
 
 
@@ -543,8 +534,6 @@ class StableNormalPipeline(StableDiffusionControlNetPipeline):
             # 这里改成使用dino作为image的解码器
             # clip_image_embeds = self.image_encoder(clip_image.to(self.device, dtype=torch.float16)).image_embeds
             dino_features_ref = self.prior(clip_image.to(self.device, dtype=torch.float16))
-            dino_features_ref = self.dino_controlnet.dino_controlnet_cond_embedding(dino_features_ref)
-            dino_features_ref = self.df_model(dino_features_ref).to(self.device)
         else:
             dino_features_ref = clip_image_embeds.to(self.device, dtype=torch.float16)
 
@@ -688,20 +677,6 @@ class StableNormalPipeline(StableDiffusionControlNetPipeline):
         '''
         ref_normal的预处理
         '''
-
-        # ref_normal, padding, original_resolution = self.image_processor.preprocess(
-        #     ref_normal, processing_resolution, resample_method_input, device, dtype
-        # )  # [N,3,PPH,PPW]
-
-        # image_latent_ref, gaus_noise_ref = self.prepare_latents(
-        #     ref_normal, latents, generator, ensemble_size, batch_size
-        # )  # [N,4,h,w], [N,4,h,w]
-
-
-        # predictor_ref = self.x_start_pipeline(image, latents=gaus_noise, 
-        #                             processing_resolution=processing_resolution, skip_preprocess=True)
-        # x_start_latent_ref = predictor_ref.latent
-
 
         # 1. Check inputs.
         num_images = self.check_inputs(
@@ -1476,18 +1451,6 @@ def retrieve_timesteps(
     return timesteps, num_inference_steps
 
 
-class DinoFeatureModel(torch.nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.global_pool = nn.AdaptiveAvgPool2d((1, 1))  # 全局平均池化
-        self.fc = nn.Linear(320, 1024)                   # 线性映射
-
-    def forward(self, x):
-        x = self.global_pool(x)  # [batch, 1024, 1, 1]
-        x = x.flatten(1)         # [batch, 1024]
-        x = self.fc(x)            # [batch, 1024]
-        return x
-
 # 图像投影模型：将CLIP图像特征映射为提示词序列
 class ImageProjModel(torch.nn.Module):
     def __init__(self, clip_embed_dim=1024, cross_attention_dim=1024, num_tokens=4):
@@ -1497,24 +1460,29 @@ class ImageProjModel(torch.nn.Module):
 
         self.generator = None
 
-        self.proj = torch.nn.Linear(clip_embed_dim, self.num_tokens * cross_attention_dim)
+        self.proj = torch.nn.Linear(clip_embed_dim, cross_attention_dim)
         self.norm = torch.nn.LayerNorm(cross_attention_dim)
 
-        
-    def forward(self, image_embeds):
+    def forward(self, x):
         # image_embeds: [B, clip_embed_dim]
+        assert not torch.isnan(x).any(), "输入包含NaN"
 
-        assert not torch.isnan(image_embeds).any(), "输入包含NaN"
+        b, c, h, w = x.shape
 
-        
-        embeds = image_embeds
-        clip_extra_context_tokens = self.proj(embeds)
-        clip_extra_context_tokens = clip_extra_context_tokens.reshape(
-            -1, self.num_tokens, self.cross_attention_dim
-        )
-        clip_extra_context_tokens = self.norm(clip_extra_context_tokens)
-    
-        return clip_extra_context_tokens
+        # 1. 展平空间维度: [b, 1024, 2304]
+        x = x.reshape(b, c, h * w)
+
+        # 2. 交换维度和合并Batch: [b*2304, 1024]
+        x = x.permute(0, 2, 1)  # [b, 2304, 1024]
+        x = x.reshape(-1, c)    # [b*2304, 1024]
+
+        # 3. 线性映射: [b*2304, cross_attention_dim]
+        x = self.proj(x)
+        x = x.reshape(b, h * w, -1)  # [b, 2304, cross_attention_dim]
+
+        # 5. 归一化
+        x = self.norm(x)
+        return x
     
 class AdapterModule(torch.nn.Module):
     def __init__(self, unet, adapter_dim=64):
@@ -1539,13 +1507,4 @@ class AdapterModule(torch.nn.Module):
                         for param in transformer_block.attn2.parameters():
                             param.requires_grad = False
                         
-
-
-class AttnProcessorWrapper(torch.nn.Module):
-    def __init__(self, processor):
-        super().__init__()
-        self.processor = processor
-
-    def forward(self, *args, **kwargs):
-        return self.processor(*args, **kwargs)
 
