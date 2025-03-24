@@ -251,7 +251,7 @@ class WrapperLightningModule(pl.LightningModule):
             ignore_mismatched_sizes=True
         )
         original_conv_in = self.pipe.unet.conv_in
-        self.conv_in = nn.Conv2d(8, 320, kernel_size=3, padding=1)
+        self.conv_in = nn.Conv2d(8, 320, kernel_size=3, padding=1, dtype=torch.float16)
 
         # 创建新的 conv_in 层（输入通道改为 8，其他参数不变）
         new_conv_in = nn.Conv2d(

@@ -522,6 +522,14 @@ class StableNormalPipeline(StableDiffusionControlNetPipeline):
         }
         ip_layers.load_state_dict(adapter_modules_weights)
 
+        conv_in_weights = {
+            k.replace("conv_in.", "", 1): v 
+            for k, v in model_weights.items() 
+            if k.startswith("conv_in.")
+        }
+        self.unet.conv_in = nn.Conv2d(8, 320, kernel_size=3, padding=1, dtype=torch.float16)
+        self.unet.conv_in.load_state_dict(conv_in_weights)
+
         print(f"Successfully loaded weights from checkpoint {ckpt_path}")
 
 
@@ -753,7 +761,8 @@ class StableNormalPipeline(StableDiffusionControlNetPipeline):
         # uncond_image_prompt_embeds = uncond_image_prompt_embeds.view(bs_embed * num_samples, seq_len, -1)
 
         # bs 4 1024 + bs 77 1024 = bs 81 1024
-        encoder_hidden_states = torch.cat([self.prompt_embeds, image_prompt_embeds], dim = 1)
+        encoder_hidden_states = torch.cat([self.prompt_embeds, image_prompt_embeds], dim = 1).half()
+        print(f"encoder_hidden_states:{encoder_hidden_states.shape}")
 
         # 7. denoise sampling, using heuritic sampling proposed by Ye.
 
@@ -778,6 +787,9 @@ class StableNormalPipeline(StableDiffusionControlNetPipeline):
         #     return_dict=False,
         # )
         # assert dino_mid_block_res_sample == None
+        latent = pred_latent
+        # pred_latent = torch.cat([gaus_noise, pred_latent], dim=1).half()
+        print(f"pred_latent:{pred_latent.shape}")
 
         pred_latents = []
         # Denoising loop
@@ -795,6 +807,8 @@ class StableNormalPipeline(StableDiffusionControlNetPipeline):
             #     guess_mode=False,
             #     return_dict=False,
             # )
+            
+            pred_latent = torch.cat([gaus_noise, latent], dim=1)
 
             # SG-DRN
             # 在每个时间步t中，模型使用DINO UNet进行去噪操作 
@@ -814,9 +828,10 @@ class StableNormalPipeline(StableDiffusionControlNetPipeline):
             pred_latents.append(noise)
             # ddim steps 利用调度器更新潜在变量
             out = self.scheduler.step(
-                noise, t, prev_t, pred_latent, gaus_noise = gaus_noise, generator=generator, cur_step=cur_step+1  # NOTE that cur_step dirs to next_step
+                noise, t, prev_t, latent, gaus_noise = gaus_noise, generator=generator, cur_step=cur_step+1  # NOTE that cur_step dirs to next_step
             )# [B,4,h,w]
-            pred_latent = out.prev_sample
+
+            latent = out.prev_sample
 
             cur_step += 1
 
@@ -1003,7 +1018,6 @@ class StableNormalPipeline(StableDiffusionControlNetPipeline):
         # The overall upsampling factor is equal to 2 ** (# num of upsampling layers).
         # However, the upsampling interpolation output size can be forced to fit any upsampling size
         # on the fly if necessary.
-
 
         default_overall_up_factor = 2**self.num_upsamplers
 
